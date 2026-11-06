@@ -36,10 +36,18 @@ cdef extern from "htslib/hfile.h":
         pass
     hFILE *hdopen(int fd, const char *mode);
 
+cdef extern from "htslib/bgzf.h":
+    ctypedef struct BGZF:
+        pass
+    int64_t bgzf_tell(BGZF *fp)
+
 cdef extern from "htslib/hts.h":
 
 
     int hts_set_threads(htsFile *fp, int n);
+    cdef enum:
+        HTS_FMT_CSI
+        HTS_FMT_TBI
 
     cdef enum:
         HTS_IDX_START
@@ -47,6 +55,7 @@ cdef extern from "htslib/hts.h":
 
     cdef union ufp:
         hFILE *hfile;
+        BGZF *bgzf;
 
     cdef enum htsExactFormat:
         unknown_format,
@@ -57,6 +66,7 @@ cdef extern from "htslib/hts.h":
         htsExactFormat format
 
     ctypedef struct htsFile:
+        int is_bgzf
         ufp fp
         htsFormat format
 
@@ -65,6 +75,12 @@ cdef extern from "htslib/hts.h":
     htsFile *hts_open(char *fn, char *mode);
 
     htsFile *hts_hopen(hFILE *fp, const char *fn, const char *mode);
+    hts_idx_t *hts_idx_init(int n, int fmt, uint64_t offset0, int min_shift, int n_lvls);
+    int hts_idx_push(hts_idx_t *idx, int tid, int64_t beg, int64_t end, uint64_t offset, int is_mapped);
+    int hts_idx_finish(hts_idx_t *idx, uint64_t final_offset);
+    int hts_idx_set_meta(hts_idx_t *idx, uint32_t l_meta, uint8_t *meta, int is_copy);
+    int hts_idx_tbi_name(hts_idx_t *idx, int tid, const char *name);
+    int hts_idx_save_as(const hts_idx_t *idx, const char *fn, const char *fnidx, int fmt);
 
     cdef int hts_verbose = 1
 
@@ -86,7 +102,10 @@ cdef extern from "htslib/hts.h":
 
 cdef extern from "htslib/tbx.h":
     ctypedef struct tbx_conf_t:
-        pass
+        int32_t preset
+        int32_t sc, bc, ec
+        int32_t meta_char, line_skip
+    const tbx_conf_t tbx_conf_vcf
 
     # Expose details of tbx_t so that we can access the idx field
     ctypedef struct tbx_t:
@@ -281,13 +300,13 @@ cdef extern from "htslib/vcf.h":
 
 
     bcf_fmt_t *bcf_get_fmt(const bcf_hdr_t *hdr, bcf1_t *line, const char *key);
-
     int bcf_get_genotypes(const bcf_hdr_t *hdr, bcf1_t *line, int32_t **dst, int *ndst);
     int bcf_get_format_int32(const bcf_hdr_t *hdr, bcf1_t *line, char * tag, int **dst, int *ndst);
     int bcf_get_format_float(const bcf_hdr_t *hdr, bcf1_t *line, char * tag, float **dst, int *ndst)
     int bcf_get_format_string(const bcf_hdr_t *hdr, bcf1_t *line, const char *tag, char ***dst, int *ndst);
 
     int bcf_get_format_values(const bcf_hdr_t *hdr, bcf1_t *line, const char *tag, void **dst, int *ndst, int type);
+    int bcf_get_info_values(const bcf_hdr_t *hdr, bcf1_t *line, const char *tag, void **dst, int *ndst, int type);
     int bcf_gt_is_phased(int);
     int bcf_gt_is_missing(int);
     int bcf_gt_allele(int);

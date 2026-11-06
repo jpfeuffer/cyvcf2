@@ -194,6 +194,15 @@ cdef set_constants(VCF v):
         v.HOM_ALT = 3
 
 
+cdef struct SchemaFieldStats:
+    uint64_t records
+    uint64_t total_values
+    int min_cardinality
+    int max_cardinality
+    bint has_numeric
+    double min_value
+    double max_value
+
 
 cdef class HTSFile:
 
@@ -470,6 +479,446 @@ cdef class VCF(HTSFile):
             self.idx = tbx_index_load2(to_bytes(self.fname), to_bytes(index_path))
         if self.hidx == NULL and self.idx == NULL:
           raise OSError("unable to open index:'%s' for '%s'" % (index_path, self.fname))
+
+    def schema_scan(self, index_path=None, threads=None):
+        """Scan the complete VCF/BCF and return compact field statistics.
+
+        ``index_path`` may name an existing index to reuse, or a destination
+        where an index will be built during this scan if it does not exist.
+        No index is created when ``index_path`` is ``None``. Index creation
+        requires a BGZF-compressed, coordinate-sorted input file.
+        """
+        cdef htsFile *scan_hts = NULL
+        cdef bcf_hdr_t *scan_hdr = NULL
+        cdef bcf1_t *record = NULL
+        cdef hts_idx_t *index = NULL
+        cdef tbx_t *existing_tbx = NULL
+        cdef hts_idx_t *existing_index = NULL
+        cdef SchemaFieldStats *field_stats = NULL
+        cdef int32_t *genotypes = NULL
+        cdef int32_t *int_values = NULL
+        cdef float *float_values = NULL
+        cdef uint64_t *allele_counts = NULL
+        cdef uint64_t *alleles_per_record = NULL
+        cdef uint64_t *ploidy_counts = NULL
+        cdef int genotype_capacity = 0
+        cdef int int_capacity = 0
+        cdef int float_capacity = 0
+        cdef int allele_capacity = 0
+        cdef int alleles_per_record_capacity = 0
+        cdef int ploidy_capacity = 0
+        cdef uint64_t *resized_counts = NULL
+        cdef int n_fields = 0
+        cdef int n_contigs = 0
+        cdef int n_samples = 0
+        cdef int ret = 0
+        cdef int n_values = 0
+        cdef int n_genotypes = 0
+        cdef int stride = 0
+        cdef int sample_index = 0
+        cdef int value_index = 0
+        cdef int field_index = 0
+        cdef int field_type = 0
+        cdef int cardinality = 0
+        cdef int meta_index = 0
+        cdef int ploidy = 0
+        cdef int allele_index = 0
+        cdef int index_format = HTS_FMT_CSI
+        cdef int index_status = 0
+        cdef int min_shift = 14
+        cdef int n_levels = 5
+        cdef uint64_t record_count = 0
+        cdef uint64_t missing_genotype_alleles = 0
+        cdef int64_t record_offset = 0
+        cdef int64_t final_offset = 0
+        cdef const char *tag = NULL
+        cdef bytes index_path_bytes
+        cdef bint build_index = False
+        cdef bint index_available = False
+        cdef bint index_created = False
+        cdef bint local_index_exists = False
+        cdef bint is_info
+        cdef double numeric_value
+        cdef SchemaFieldStats *stats
+        cdef uint8_t tbi_metadata[28]
+
+        if self.fname is None:
+            raise ValueError("schema_scan requires a VCF/BCF filename")
+        if threads is not None and (not isinstance(threads, int) or threads < 1):
+            raise ValueError("threads must be a positive integer")
+
+        scan_hts = hts_open(self.fname, b"r")
+        if scan_hts == NULL:
+            raise IOError("Error opening %s" % self.fname)
+        try:
+            if threads is not None:
+                ret = hts_set_threads(scan_hts, threads)
+                if ret < 0:
+                    raise IOError("error setting number of threads: %d" % ret)
+
+            scan_hdr = bcf_hdr_read(scan_hts)
+            if scan_hdr == NULL:
+                raise IOError("cannot parse VCF header")
+            n_fields = scan_hdr.n[BCF_DT_ID]
+            n_contigs = scan_hdr.n[BCF_DT_CTG]
+            n_samples = bcf_hdr_nsamples(scan_hdr)
+            field_stats = <SchemaFieldStats *>stdlib.calloc(
+                <size_t>(2 * n_fields), sizeof(SchemaFieldStats))
+            if field_stats == NULL and n_fields > 0:
+                raise MemoryError()
+
+            if index_path is not None:
+                index_path_bytes = to_bytes(str(index_path) if isinstance(index_path, Path) else index_path)
+                if index_path_bytes == self.fname:
+                    raise ValueError("index_path must differ from the input path")
+                if index_path_bytes.endswith(b".tbi"):
+                    index_format = HTS_FMT_TBI
+                local_index_exists = os.path.exists(index_path)
+                if local_index_exists or b"://" in index_path_bytes:
+                    existing_index = hts_idx_load2(self.fname, index_path_bytes)
+                    if existing_index != NULL:
+                        index_available = True
+                        hts_idx_destroy(existing_index)
+                        existing_index = NULL
+                    elif local_index_exists:
+                        raise OSError("unable to read existing index: %s" % index_path)
+                    else:
+                        build_index = True
+                else:
+                    build_index = True
+            elif scan_hts.format.format == bcf:
+                if (b"://" in self.fname or
+                        os.path.exists(self.fname + b".csi")):
+                    existing_index = bcf_index_load(self.fname)
+                    if existing_index != NULL:
+                        index_available = True
+                        hts_idx_destroy(existing_index)
+                        existing_index = NULL
+            else:
+                if (b"://" in self.fname or
+                        os.path.exists(self.fname + b".csi") or
+                        os.path.exists(self.fname + b".tbi")):
+                    existing_tbx = tbx_index_load(self.fname)
+                    if existing_tbx != NULL:
+                        index_available = True
+                        tbx_destroy(existing_tbx)
+                        existing_tbx = NULL
+
+            if build_index:
+                if not scan_hts.is_bgzf:
+                    raise ValueError("index creation requires BGZF-compressed VCF/BCF")
+                if index_format == HTS_FMT_TBI and scan_hts.format.format != vcf:
+                    raise ValueError("TBI indexes can only be created for VCF files")
+                index = hts_idx_init(
+                    n_contigs, index_format, <uint64_t>bgzf_tell(scan_hts.fp.bgzf),
+                    min_shift, n_levels)
+                if index == NULL:
+                    raise MemoryError("unable to initialize index")
+                if index_format == HTS_FMT_TBI:
+                    memcpy(tbi_metadata, &tbx_conf_vcf, sizeof(tbx_conf_t))
+                    for meta_index in range(sizeof(tbx_conf_t), 28):
+                        tbi_metadata[meta_index] = 0
+                    if hts_idx_set_meta(index, 28, tbi_metadata, 1) < 0:
+                        raise MemoryError("unable to set TBI index metadata")
+                    for field_index in range(n_contigs):
+                        tag = bcf_hdr_int2id(scan_hdr, BCF_DT_CTG, field_index)
+                        if tag == NULL or hts_idx_tbi_name(index, field_index, tag) < 0:
+                            raise ValueError("unable to add contig name to TBI index")
+
+            record = bcf_init()
+            if record == NULL:
+                raise MemoryError("unable to initialize VCF record")
+            while True:
+                if build_index:
+                    record_offset = bgzf_tell(scan_hts.fp.bgzf)
+                with nogil:
+                    ret = bcf_read(scan_hts, scan_hdr, record)
+                if ret == -1:
+                    break
+                if ret < 0:
+                    raise IOError("error reading VCF/BCF record (error-code: %d)" % ret)
+
+                if build_index:
+                    if record.rid < 0 or hts_idx_push(
+                            index, record.rid, record.pos,
+                            record.pos + record.rlen, <uint64_t>record_offset, 1) < 0:
+                        raise ValueError(
+                            "cannot build index: records must have defined contigs "
+                            "and be coordinate-sorted")
+
+                if bcf_unpack(record, 15) != 0:
+                    raise IOError("unable to unpack VCF/BCF record")
+                record_count += 1
+
+                if record.n_allele > alleles_per_record_capacity:
+                    resized_counts = <uint64_t *>stdlib.realloc(
+                        alleles_per_record, <size_t>record.n_allele * sizeof(uint64_t))
+                    if resized_counts == NULL:
+                        raise MemoryError()
+                    alleles_per_record = resized_counts
+                    for value_index in range(alleles_per_record_capacity, record.n_allele):
+                        alleles_per_record[value_index] = 0
+                    alleles_per_record_capacity = record.n_allele
+                if record.n_allele > 0:
+                    alleles_per_record[record.n_allele - 1] += 1
+
+                for value_index in range(record.n_info):
+                    field_index = record.d.info[value_index].key
+                    if field_index < 0 or field_index >= n_fields:
+                        continue
+                    stats = &field_stats[field_index]
+                    cardinality = record.d.info[value_index].len
+                    stats.records += 1
+                    stats.total_values += cardinality
+                    if stats.records == 1 or cardinality < stats.min_cardinality:
+                        stats.min_cardinality = cardinality
+                    if stats.records == 1 or cardinality > stats.max_cardinality:
+                        stats.max_cardinality = cardinality
+                    field_type = bcf_hdr_id2type(scan_hdr, BCF_HL_INFO, field_index)
+                    tag = bcf_hdr_int2id(scan_hdr, BCF_DT_ID, field_index)
+                    if tag == NULL:
+                        continue
+                    if field_type == BCF_HT_INT:
+                        n_values = bcf_get_info_values(
+                            scan_hdr, record, tag, <void **>&int_values,
+                            &int_capacity, BCF_HT_INT)
+                        if n_values < 0:
+                            raise IOError("unable to read INFO field values")
+                        for value_index in range(n_values):
+                            if int_values[value_index] == bcf_int32_missing or int_values[value_index] == bcf_int32_vector_end:
+                                continue
+                            numeric_value = int_values[value_index]
+                            if not stats.has_numeric:
+                                stats.min_value = numeric_value
+                                stats.max_value = numeric_value
+                                stats.has_numeric = True
+                            else:
+                                if numeric_value < stats.min_value:
+                                    stats.min_value = numeric_value
+                                if numeric_value > stats.max_value:
+                                    stats.max_value = numeric_value
+                    elif field_type == BCF_HT_REAL:
+                        n_values = bcf_get_info_values(
+                            scan_hdr, record, tag, <void **>&float_values,
+                            &float_capacity, BCF_HT_REAL)
+                        if n_values < 0:
+                            raise IOError("unable to read INFO field values")
+                        for value_index in range(n_values):
+                            if bcf_float_is_missing(float_values[value_index]) or bcf_float_is_vector_end(float_values[value_index]):
+                                continue
+                            numeric_value = float_values[value_index]
+                            if not stats.has_numeric:
+                                stats.min_value = numeric_value
+                                stats.max_value = numeric_value
+                                stats.has_numeric = True
+                            else:
+                                if numeric_value < stats.min_value:
+                                    stats.min_value = numeric_value
+                                if numeric_value > stats.max_value:
+                                    stats.max_value = numeric_value
+
+                for value_index in range(record.n_fmt):
+                    field_index = record.d.fmt[value_index].id
+                    if field_index < 0 or field_index >= n_fields:
+                        continue
+                    stats = &field_stats[n_fields + field_index]
+                    cardinality = record.d.fmt[value_index].n
+                    stats.records += 1
+                    stats.total_values += <uint64_t>cardinality * n_samples
+                    if stats.records == 1 or cardinality < stats.min_cardinality:
+                        stats.min_cardinality = cardinality
+                    if stats.records == 1 or cardinality > stats.max_cardinality:
+                        stats.max_cardinality = cardinality
+                    field_type = bcf_hdr_id2type(scan_hdr, BCF_HL_FMT, field_index)
+                    tag = bcf_hdr_int2id(scan_hdr, BCF_DT_ID, field_index)
+                    if tag == NULL or tag == b"GT":
+                        continue
+                    if field_type == BCF_HT_INT:
+                        n_values = bcf_get_format_values(
+                            scan_hdr, record, tag, <void **>&int_values,
+                            &int_capacity, BCF_HT_INT)
+                        if n_values < 0:
+                            raise IOError("unable to read FORMAT field values")
+                        for value_index in range(n_values):
+                            if int_values[value_index] == bcf_int32_missing or int_values[value_index] == bcf_int32_vector_end:
+                                continue
+                            numeric_value = int_values[value_index]
+                            if not stats.has_numeric:
+                                stats.min_value = numeric_value
+                                stats.max_value = numeric_value
+                                stats.has_numeric = True
+                            else:
+                                if numeric_value < stats.min_value:
+                                    stats.min_value = numeric_value
+                                if numeric_value > stats.max_value:
+                                    stats.max_value = numeric_value
+                    elif field_type == BCF_HT_REAL:
+                        n_values = bcf_get_format_values(
+                            scan_hdr, record, tag, <void **>&float_values,
+                            &float_capacity, BCF_HT_REAL)
+                        if n_values < 0:
+                            raise IOError("unable to read FORMAT field values")
+                        for value_index in range(n_values):
+                            if bcf_float_is_missing(float_values[value_index]) or bcf_float_is_vector_end(float_values[value_index]):
+                                continue
+                            numeric_value = float_values[value_index]
+                            if not stats.has_numeric:
+                                stats.min_value = numeric_value
+                                stats.max_value = numeric_value
+                                stats.has_numeric = True
+                            else:
+                                if numeric_value < stats.min_value:
+                                    stats.min_value = numeric_value
+                                if numeric_value > stats.max_value:
+                                    stats.max_value = numeric_value
+
+                n_genotypes = bcf_get_genotypes(
+                    scan_hdr, record, &genotypes, &genotype_capacity)
+                if n_genotypes > 0 and n_samples > 0:
+                    if n_genotypes % n_samples != 0:
+                        raise IOError("invalid genotype vector cardinality")
+                    stride = n_genotypes // n_samples
+                    if stride > ploidy_capacity:
+                        resized_counts = <uint64_t *>stdlib.realloc(
+                            ploidy_counts, <size_t>(stride + 1) * sizeof(uint64_t))
+                        if resized_counts == NULL:
+                            raise MemoryError()
+                        ploidy_counts = resized_counts
+                        for value_index in range(ploidy_capacity, stride + 1):
+                            ploidy_counts[value_index] = 0
+                        ploidy_capacity = stride
+                    for sample_index in range(n_samples):
+                        ploidy = 0
+                        for value_index in range(stride):
+                            allele_index = genotypes[sample_index * stride + value_index]
+                            if allele_index == bcf_int32_vector_end:
+                                break
+                            ploidy += 1
+                            if bcf_gt_is_missing(allele_index):
+                                missing_genotype_alleles += 1
+                                continue
+                            allele_index = bcf_gt_allele(allele_index)
+                            if allele_index < 0:
+                                missing_genotype_alleles += 1
+                                continue
+                            if allele_index >= allele_capacity:
+                                resized_counts = <uint64_t *>stdlib.realloc(
+                                    allele_counts, <size_t>(allele_index + 1) * sizeof(uint64_t))
+                                if resized_counts == NULL:
+                                    raise MemoryError()
+                                allele_counts = resized_counts
+                                for field_index in range(allele_capacity, allele_index + 1):
+                                    allele_counts[field_index] = 0
+                                allele_capacity = allele_index + 1
+                            allele_counts[allele_index] += 1
+                        if ploidy > ploidy_capacity:
+                            resized_counts = <uint64_t *>stdlib.realloc(
+                                ploidy_counts, <size_t>(ploidy + 1) * sizeof(uint64_t))
+                            if resized_counts == NULL:
+                                raise MemoryError()
+                            ploidy_counts = resized_counts
+                            for value_index in range(ploidy_capacity, ploidy + 1):
+                                ploidy_counts[value_index] = 0
+                            ploidy_capacity = ploidy
+                        ploidy_counts[ploidy] += 1
+
+            if build_index:
+                final_offset = bgzf_tell(scan_hts.fp.bgzf)
+                if final_offset < 0 or hts_idx_finish(index, <uint64_t>final_offset) != 0:
+                    raise ValueError("unable to finish index; input may not be coordinate-sorted")
+                index_status = hts_idx_save_as(
+                    index, self.fname, index_path_bytes, index_format)
+                if index_status < 0:
+                    raise IOError("unable to save index to %s" % index_path)
+                index_available = True
+                index_created = True
+
+            fields = {"INFO": {}, "FORMAT": {}}
+            for is_info in (True, False):
+                for field_index in range(n_fields):
+                    stats = &field_stats[field_index if is_info else n_fields + field_index]
+                    tag = bcf_hdr_int2id(scan_hdr, BCF_DT_ID, field_index)
+                    if tag == NULL:
+                        continue
+                    field_name = from_bytes(tag)
+                    try:
+                        header_values = self.get_header_type(
+                            field_name,
+                            order=[BCF_HL_INFO if is_info else BCF_HL_FMT])
+                    except KeyError:
+                        continue
+                    numeric_bounds = None
+                    if stats.has_numeric:
+                        if header_values.get("Type") == "Integer":
+                            numeric_bounds = {
+                                "min": int(stats.min_value),
+                                "max": int(stats.max_value),
+                            }
+                        else:
+                            numeric_bounds = {
+                                "min": stats.min_value,
+                                "max": stats.max_value,
+                            }
+                    field_summary = {
+                        "type": header_values.get("Type"),
+                        "number": header_values.get("Number"),
+                        "records": int(stats.records),
+                        "total_values": int(stats.total_values),
+                        "cardinality_unit": "per_record" if is_info else "per_sample",
+                        "cardinality": {
+                            "min": stats.min_cardinality if stats.records else None,
+                            "max": stats.max_cardinality if stats.records else None,
+                        },
+                        "numeric_bounds": numeric_bounds,
+                    }
+                    fields["INFO" if is_info else "FORMAT"][field_name] = field_summary
+
+            allele_count_summary = {
+                "by_index": [int(allele_counts[value_index]) for value_index in range(allele_capacity)],
+                "missing": int(missing_genotype_alleles),
+            }
+            summary = {
+                "records": int(record_count),
+                "samples": n_samples,
+                "alleles_per_record": {
+                    value_index + 1: int(alleles_per_record[value_index])
+                    for value_index in range(alleles_per_record_capacity)
+                    if alleles_per_record[value_index] > 0
+                },
+                "allele_counts": allele_count_summary,
+                "ploidy": {
+                    value_index: int(ploidy_counts[value_index])
+                    for value_index in range(ploidy_capacity + 1)
+                    if ploidy_counts != NULL and ploidy_counts[value_index] > 0
+                },
+                "fields": fields,
+                "index": {
+                    "available": bool(index_available),
+                    "built": bool(index_created),
+                    "path": from_bytes(index_path_bytes) if index_path is not None else None,
+                },
+            }
+            return summary
+        finally:
+            if record != NULL:
+                bcf_destroy(record)
+            if index != NULL:
+                hts_idx_destroy(index)
+            if existing_index != NULL:
+                hts_idx_destroy(existing_index)
+            if existing_tbx != NULL:
+                tbx_destroy(existing_tbx)
+            if scan_hdr != NULL:
+                bcf_hdr_destroy(scan_hdr)
+            if scan_hts != NULL:
+                hts_close(scan_hts)
+            stdlib.free(field_stats)
+            stdlib.free(genotypes)
+            stdlib.free(int_values)
+            stdlib.free(float_values)
+            stdlib.free(allele_counts)
+            stdlib.free(alleles_per_record)
+            stdlib.free(ploidy_counts)
 
     def _bcf_region(VCF self, region):
         if self.hidx == NULL:

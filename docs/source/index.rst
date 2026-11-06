@@ -61,6 +61,42 @@ See the :ref:`api` for detailed documentation, but the most common usage is summ
         # 2 samples of 0/0 and 1|1 would be [[0, 0, False], [1, 1, True]]
         print v.genotypes 
 
+Schema scanning and index creation
+==================================
+
+``VCF.schema_scan()`` reads the complete file through HTSlib and returns
+record, allele, genotype-ploidy, INFO, and FORMAT summaries without creating
+Python objects for individual records. It scans an independent input stream,
+so the reader's current iteration position is preserved.
+
+.. code-block:: python
+
+    vcf = VCF("variants.vcf.gz")
+    summary = vcf.schema_scan(threads=4)
+    summary["fields"]["INFO"]["DP"]["numeric_bounds"]
+
+Each header-declared field is included in ``fields``, even if it is absent
+from all records. Its summary includes VCF ``Type`` and ``Number``, the number
+of records containing the field, total value cardinality, minimum and maximum
+cardinality, and numeric bounds when available. INFO cardinality is per
+record; FORMAT cardinality is the encoded width per sample. GT ploidy is
+summarized separately. ``allele_counts["by_index"]`` contains called
+genotype-allele counts by zero-based VCF allele index, with missing genotype
+alleles reported separately.
+
+Pass ``index_path`` to reuse an existing index at that path or create one
+during the scan when it does not exist. Index creation supports CSI for VCF or
+BCF and TBI for BGZF-compressed VCF. It requires coordinate-sorted input.
+Without ``index_path``, an existing default index is detected but no index is
+created.
+
+.. code-block:: python
+
+    summary = vcf.schema_scan(
+        index_path="variants.vcf.gz.csi",
+        threads=4,
+    )
+
 Modifying Existing Records
 ==========================
 

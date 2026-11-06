@@ -1459,6 +1459,87 @@ def test_num_records_no_index(path):
     with pytest.raises(ValueError, match="must be indexed"):
         vcf.num_records
 
+def test_schema_scan_summary():
+    path = os.path.join(HERE, "test.snpeff.vcf")
+    vcf = VCF(path)
+    expected_records = sum(1 for _ in VCF(path))
+    expected_next_pos = list(VCF(path))[2].POS
+    next(vcf)
+    next(vcf)
+    summary = vcf.schema_scan(threads=1)
+
+    assert summary["records"] == expected_records
+    assert summary["samples"] == len(vcf.samples)
+    assert summary["index"] == {"available": False, "built": False, "path": None}
+    assert sum(summary["alleles_per_record"].values()) == expected_records
+    assert sum(summary["ploidy"].values()) > 0
+    assert summary["fields"]["INFO"]["DP"]["numeric_bounds"] is not None
+    assert summary["fields"]["FORMAT"]["GT"]["cardinality"]["max"] >= 1
+    assert summary["fields"]["FORMAT"]["GT"]["total_values"] >= expected_records * len(vcf.samples)
+    assert next(vcf).POS == expected_next_pos
+
+def test_schema_scan_builds_csi_and_tbi_indexes(tmp_path):
+    path = os.path.join(HERE, "multi-contig.vcf.gz")
+    expected_records = sum(1 for _ in VCF(path))
+
+    for suffix in ("csi", "tbi"):
+        index_path = str(tmp_path / ("scan." + suffix))
+        summary = VCF(path).schema_scan(index_path=index_path, threads=2)
+        assert summary["records"] == expected_records
+        assert summary["index"] == {
+            "available": True,
+            "built": True,
+            "path": index_path,
+        }
+
+        indexed_vcf = VCF(path)
+        indexed_vcf.set_index(index_path)
+        assert indexed_vcf.num_records == expected_records
+
+def test_schema_scan_reuses_existing_index():
+    path = VCF_PATH
+    index_path = path + ".tbi"
+    summary = VCF(path).schema_scan(index_path=index_path)
+
+    assert summary["index"] == {
+        "available": True,
+        "built": False,
+        "path": index_path,
+    }
+
+def test_schema_scan_rejects_unsorted_index_input(tmp_path):
+    source = VCF(os.path.join(HERE, "test.snpeff.vcf"))
+    records = list(source)
+    output_path = str(tmp_path / "unsorted.vcf.gz")
+    writer = Writer(output_path, source)
+    for record in reversed(records):
+        writer.write_record(record)
+    writer.close()
+
+    index_path = str(tmp_path / "unsorted.csi")
+    with pytest.raises(ValueError, match="coordinate-sorted"):
+        VCF(output_path).schema_scan(index_path=index_path)
+    assert not os.path.exists(index_path)
+
+def test_schema_scan_includes_unused_header_fields(tmp_path):
+    path = tmp_path / "empty.vcf"
+    path.write_text(
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=1>\n"
+        '##INFO=<ID=DP,Number=1,Type=Integer,Description="depth">\n'
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="genotype">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n"
+    )
+
+    summary = VCF(str(path)).schema_scan()
+    assert summary["records"] == 0
+    assert summary["fields"]["INFO"]["DP"]["records"] == 0
+    assert summary["fields"]["INFO"]["DP"]["cardinality"] == {
+        "min": None,
+        "max": None,
+    }
+    assert summary["fields"]["FORMAT"]["GT"]["records"] == 0
+
 def test_reader_context_manager():
     with VCF(VCF_PATH) as vcf:
         pass
