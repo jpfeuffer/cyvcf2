@@ -13,6 +13,7 @@ from array import array
 import math
 import ctypes
 import warnings
+import struct
 try:
   from pathlib import Path
 except ImportError:
@@ -29,6 +30,10 @@ ENC = locale.getpreferredencoding()
 from cython cimport view
 
 from cpython.version cimport PY_MAJOR_VERSION
+from cpython.bytes cimport (
+    PyBytes_FromStringAndSize,
+    PyBytes_AS_STRING,
+)
 
 def set_htslib_log_level(int level):
     """
@@ -204,6 +209,319 @@ cdef struct SchemaFieldStats:
     double max_value
 
 
+cdef struct SchemaIndexEntry:
+    int32_t rid
+    int64_t beg
+    int64_t end
+    uint64_t offset
+
+
+cdef bytes _schema_vcf_index_metadata(list contig_names):
+    cdef bytes names_blob
+    names_blob = b"".join(name + b"\0" for name in contig_names)
+    return struct.pack(
+        "<7I",
+        tbx_conf_vcf.preset,
+        tbx_conf_vcf.sc,
+        tbx_conf_vcf.bc,
+        tbx_conf_vcf.ec,
+        tbx_conf_vcf.meta_char,
+        tbx_conf_vcf.line_skip,
+        len(names_blob),
+    ) + names_blob
+
+
+cdef class _SchemaIndexBuilder:
+    cdef hts_idx_t *index
+    cdef bytes fname
+    cdef bytes index_path
+    cdef int *rid_map
+    cdef int n_contigs
+    cdef int next_rid
+    cdef list header_contig_names
+    cdef list contig_names
+    cdef int index_format
+    cdef bint finished
+
+    def __cinit__(self, path, index_path):
+        cdef htsFile *fp = NULL
+        cdef bcf_hdr_t *hdr = NULL
+        cdef int n_contigs = 0
+        cdef int contig_index = 0
+        cdef int min_shift = 14
+        cdef int n_levels = 5
+        cdef int64_t offset0 = 0
+        cdef const char *contig_name = NULL
+
+        self.index = NULL
+        self.rid_map = NULL
+        self.n_contigs = 0
+        self.next_rid = 0
+        self.header_contig_names = []
+        self.contig_names = []
+        self.finished = False
+        self.fname = to_bytes(path)
+        self.index_path = to_bytes(
+            str(index_path) if isinstance(index_path, Path) else index_path)
+        if self.fname == self.index_path:
+            raise ValueError("index_path must differ from the input path")
+        self.index_format = (
+            HTS_FMT_TBI if self.index_path.endswith(b".tbi") else HTS_FMT_CSI)
+
+        fp = hts_open(self.fname, b"r")
+        if fp == NULL:
+            raise IOError("Error opening %s" % path)
+        try:
+            if not fp.is_bgzf:
+                raise ValueError("index creation requires BGZF-compressed VCF")
+            hdr = bcf_hdr_read(fp)
+            if hdr == NULL:
+                raise IOError("cannot parse VCF header")
+            if self.index_format == HTS_FMT_TBI and fp.format.format != vcf:
+                raise ValueError("TBI indexes can only be created for VCF files")
+            n_contigs = hdr.n[BCF_DT_CTG]
+            self.n_contigs = n_contigs
+            self.rid_map = <int *>stdlib.malloc(
+                <size_t>n_contigs * sizeof(int))
+            if self.rid_map == NULL and n_contigs > 0:
+                raise MemoryError("unable to allocate contig mapping")
+            for contig_index in range(n_contigs):
+                self.rid_map[contig_index] = -1
+                contig_name = bcf_hdr_int2id(
+                    hdr, BCF_DT_CTG, contig_index)
+                if contig_name == NULL:
+                    raise ValueError("unable to read VCF contig name")
+                self.header_contig_names.append(<bytes>contig_name)
+            offset0 = bgzf_tell(fp.fp.bgzf)
+            self.index = hts_idx_init(
+                0, self.index_format, <uint64_t>offset0,
+                min_shift, n_levels)
+            if self.index == NULL:
+                raise MemoryError("unable to initialize index")
+        finally:
+            if hdr != NULL:
+                bcf_hdr_destroy(hdr)
+            if fp != NULL:
+                hts_close(fp)
+
+    def add_file(self, path):
+        cdef SchemaIndexEntry *entries
+        cdef SchemaIndexEntry entry
+        cdef Py_ssize_t entry_count
+        cdef Py_ssize_t entry_index
+        cdef int mapped_rid
+        cdef size_t chunk_size = (1 << 20) // sizeof(SchemaIndexEntry) * sizeof(SchemaIndexEntry)
+        cdef object source = open(path, "rb")
+        cdef bytes payload
+
+        try:
+            while True:
+                payload = source.read(chunk_size)
+                if not payload:
+                    break
+                if len(payload) % sizeof(SchemaIndexEntry) != 0:
+                    raise IOError("invalid chunk index entry file")
+                entries = <SchemaIndexEntry *>PyBytes_AS_STRING(payload)
+                entry_count = len(payload) // sizeof(SchemaIndexEntry)
+                for entry_index in range(entry_count):
+                    entry = entries[entry_index]
+                    if entry.rid < 0 or entry.rid >= self.n_contigs:
+                        raise ValueError("invalid contig ID in index entries")
+                    mapped_rid = self.rid_map[entry.rid]
+                    if mapped_rid < 0:
+                        mapped_rid = self.next_rid
+                        self.rid_map[entry.rid] = mapped_rid
+                        self.next_rid += 1
+                        self.contig_names.append(
+                            self.header_contig_names[entry.rid])
+                    if hts_idx_push(
+                            self.index, mapped_rid, entry.beg, entry.end,
+                            entry.offset, 1) < 0:
+                        raise ValueError(
+                            "cannot build index: records must be coordinate-sorted")
+        finally:
+            source.close()
+
+    def finish(self, int64_t final_offset):
+        cdef int ret
+        cdef bytes metadata
+
+        if self.finished:
+            raise ValueError("index builder is already finished")
+        if final_offset < 0 or hts_idx_finish(
+                self.index, <uint64_t>final_offset) != 0:
+            raise ValueError("unable to finish index; input may not be coordinate-sorted")
+        metadata = _schema_vcf_index_metadata(self.contig_names)
+        if hts_idx_set_meta(
+                self.index, len(metadata),
+                <uint8_t *>PyBytes_AS_STRING(metadata), 1) < 0:
+            raise MemoryError("unable to set tabix index metadata")
+        ret = hts_idx_save_as(
+            self.index, self.fname, self.index_path, self.index_format)
+        if ret < 0:
+            raise IOError("unable to save index to %s" % self.index_path)
+        self.finished = True
+
+    def __dealloc__(self):
+        if self.index != NULL:
+            hts_idx_destroy(self.index)
+        if self.rid_map != NULL:
+            stdlib.free(self.rid_map)
+
+
+def _schema_bgzf_ranges(path, int workers):
+    import bisect
+    import struct
+
+    file_size = os.path.getsize(path)
+    block_offsets = []
+    with open(path, "rb") as source:
+        offset = 0
+        while offset < file_size:
+            source.seek(offset)
+            fixed = source.read(12)
+            if len(fixed) != 12 or fixed[:2] != b"\x1f\x8b" or not (fixed[3] & 4):
+                raise ValueError("parallel schema scanning requires BGZF input")
+            extra_length = struct.unpack("<H", fixed[10:12])[0]
+            extra = source.read(extra_length)
+            if len(extra) != extra_length:
+                raise IOError("truncated BGZF extra header")
+            block_size = None
+            cursor = 0
+            while cursor + 4 <= extra_length:
+                subfield_length = struct.unpack("<H", extra[cursor + 2:cursor + 4])[0]
+                subfield_end = cursor + 4 + subfield_length
+                if subfield_end > extra_length:
+                    raise IOError("invalid BGZF extra subfield")
+                if extra[cursor:cursor + 2] == b"BC" and subfield_length == 2:
+                    block_size = struct.unpack("<H", extra[cursor + 4:subfield_end])[0] + 1
+                    break
+                cursor = subfield_end
+            if block_size is None or block_size < 18 or offset + block_size > file_size:
+                raise IOError("invalid BGZF block header")
+            block_offsets.append(offset)
+            offset += block_size
+
+    if not block_offsets:
+        raise ValueError("empty BGZF input")
+    target_offsets = [
+        file_size * worker // workers
+        for worker in range(1, workers)
+    ]
+    boundaries = []
+    target_index = 0
+    for block_offset in block_offsets:
+        while target_index < len(target_offsets) and block_offset >= target_offsets[target_index]:
+            if not boundaries or boundaries[-1] != block_offset:
+                boundaries.append(block_offset)
+            target_index += 1
+    boundaries = [offset for offset in boundaries if offset < file_size]
+    starts = [-1] + [offset << 16 for offset in boundaries]
+    ends = [offset << 16 for offset in boundaries] + [(1 << 63) - 1]
+    ranges = []
+    for i, (start, end) in enumerate(zip(starts, ends)):
+        if start < 0:
+            seek_offset = -1
+        else:
+            block_index = bisect.bisect_left(block_offsets, start >> 16)
+            seek_offset = block_offsets[max(0, block_index - 1)] << 16
+        ranges.append((start, end, seek_offset))
+    return ranges
+
+
+def _schema_scan_worker(args):
+    path, start, end, seek, threads, collect_index, index_entries_path = args
+    reader = VCF(path)
+    try:
+        return reader._schema_scan_chunk(
+            start, end, seek, threads, collect_index, index_entries_path)
+    finally:
+        reader.close()
+
+
+def _schema_index_is_available(path, index_path=None):
+    cdef bytes fname = to_bytes(path)
+    cdef bytes idxname
+    cdef hts_idx_t *index = NULL
+    cdef tbx_t *tbx = NULL
+    cdef list candidates
+
+    if index_path is not None:
+        idxname = to_bytes(
+            str(index_path) if isinstance(index_path, Path) else index_path)
+        if fname == idxname:
+            raise ValueError("index_path must differ from the input path")
+        if not os.path.exists(index_path):
+            return False
+        if idxname.endswith((b".tbi", b".csi")):
+            tbx = tbx_index_load2(fname, idxname)
+            if tbx != NULL:
+                tbx_destroy(tbx)
+                return True
+        else:
+            index = hts_idx_load2(fname, idxname)
+            if index != NULL:
+                hts_idx_destroy(index)
+                return True
+        raise OSError("unable to read existing index: %s" % index_path)
+
+    candidates = [fname + b".csi", fname + b".tbi"]
+    for idxname in candidates:
+        if not os.path.exists(idxname):
+            continue
+        if idxname.endswith((b".tbi", b".csi")):
+            tbx = tbx_index_load2(fname, idxname)
+            if tbx != NULL:
+                tbx_destroy(tbx)
+                return True
+        else:
+            index = hts_idx_load2(fname, idxname)
+            if index != NULL:
+                hts_idx_destroy(index)
+                return True
+    return False
+
+
+def _merge_schema_scan_summaries(summaries):
+    merged = summaries[0]
+    merged["records"] = sum(summary["records"] for summary in summaries)
+    for summary in summaries[1:]:
+        for key, count in summary["alleles_per_record"].items():
+            merged["alleles_per_record"][key] = (
+                merged["alleles_per_record"].get(key, 0) + count)
+        merged["allele_counts"]["missing"] += summary["allele_counts"]["missing"]
+        counts = merged["allele_counts"]["by_index"]
+        for i, count in enumerate(summary["allele_counts"]["by_index"]):
+            if i >= len(counts):
+                counts.extend([0] * (i + 1 - len(counts)))
+            counts[i] += count
+        for ploidy, count in summary["ploidy"].items():
+            merged["ploidy"][ploidy] = merged["ploidy"].get(ploidy, 0) + count
+        for section in ("INFO", "FORMAT"):
+            for name, field in summary["fields"][section].items():
+                target = merged["fields"][section][name]
+                target["records"] += field["records"]
+                target["total_values"] += field["total_values"]
+                if field["cardinality"]["min"] is not None:
+                    current_min = target["cardinality"]["min"]
+                    current_max = target["cardinality"]["max"]
+                    target["cardinality"]["min"] = (
+                        field["cardinality"]["min"] if current_min is None
+                        else min(current_min, field["cardinality"]["min"]))
+                    target["cardinality"]["max"] = (
+                        field["cardinality"]["max"] if current_max is None
+                        else max(current_max, field["cardinality"]["max"]))
+                bounds = field["numeric_bounds"]
+                if bounds is not None:
+                    current = target["numeric_bounds"]
+                    if current is None:
+                        target["numeric_bounds"] = dict(bounds)
+                    else:
+                        current["min"] = min(current["min"], bounds["min"])
+                        current["max"] = max(current["max"], bounds["max"])
+    return merged
+
+
 cdef class HTSFile:
 
     cdef htsFile *hts
@@ -309,6 +627,9 @@ cdef class VCF(HTSFile):
     cdef bint gts012
     cdef bint lazy
     cdef bint strict_gt
+    cdef object _schema_chunk
+    cdef object _schema_chunk_index_path
+    cdef bint _schema_collect_chunk_index
     cdef list _seqnames
     cdef list _seqlens
     # holds a lookup of format field -> type.
@@ -325,6 +646,9 @@ cdef class VCF(HTSFile):
 
     def __init__(self, fname, mode="r", gts012=False, lazy=False, strict_gt=False, samples=None, threads=None):
         cdef bcf_hdr_t *hdr
+        self._schema_chunk = None
+        self._schema_chunk_index_path = None
+        self._schema_collect_chunk_index = False
         self._open_htsfile(fname, mode)
         hdr = self.hdr = bcf_hdr_read(self.hts)
         if hdr == NULL:
@@ -469,7 +793,7 @@ cdef class VCF(HTSFile):
             hts_idx_destroy(self.hidx)
             self.hidx = NULL
 
-        if index_path.endswith(".tbi"):
+        if index_path.endswith((".tbi", ".csi")):
             self.idx = tbx_index_load2(to_bytes(self.fname), to_bytes(index_path))
             if self.idx != NULL:
                 return
@@ -480,13 +804,28 @@ cdef class VCF(HTSFile):
         if self.hidx == NULL and self.idx == NULL:
           raise OSError("unable to open index:'%s' for '%s'" % (index_path, self.fname))
 
-    def schema_scan(self, index_path=None, threads=None):
+    def _schema_scan_chunk(
+            self, start, end, seek, threads, collect_index, index_entries_path):
+        self._schema_chunk = (start, end, seek)
+        self._schema_collect_chunk_index = collect_index
+        self._schema_chunk_index_path = index_entries_path
+        try:
+            return self.schema_scan(threads=threads)
+        finally:
+            self._schema_chunk = None
+            self._schema_collect_chunk_index = False
+            self._schema_chunk_index_path = None
+
+    def schema_scan(self, index_path=None, threads=None, workers=1):
         """Scan the complete VCF/BCF and return compact field statistics.
 
         ``index_path`` may name an existing index to reuse, or a destination
         where an index will be built during this scan if it does not exist.
         No index is created when ``index_path`` is ``None``. Index creation
         requires a BGZF-compressed, coordinate-sorted input file.
+        ``workers`` parallelizes local BGZF-compressed VCF scans across
+        independent file ranges. Requested index entries are merged in file
+        order and written after all ranges have completed.
         """
         cdef htsFile *scan_hts = NULL
         cdef bcf_hdr_t *scan_hdr = NULL
@@ -495,9 +834,11 @@ cdef class VCF(HTSFile):
         cdef tbx_t *existing_tbx = NULL
         cdef hts_idx_t *existing_index = NULL
         cdef SchemaFieldStats *field_stats = NULL
+        cdef SchemaIndexEntry *chunk_entries = NULL
         cdef int32_t *genotypes = NULL
         cdef int32_t *int_values = NULL
         cdef float *float_values = NULL
+        cdef int *index_rid_map = NULL
         cdef uint64_t *allele_counts = NULL
         cdef uint64_t *alleles_per_record = NULL
         cdef uint64_t *ploidy_counts = NULL
@@ -507,6 +848,7 @@ cdef class VCF(HTSFile):
         cdef int allele_capacity = 0
         cdef int alleles_per_record_capacity = 0
         cdef int ploidy_capacity = 0
+        cdef size_t chunk_entry_capacity = 0
         cdef uint64_t *resized_counts = NULL
         cdef int n_fields = 0
         cdef int n_contigs = 0
@@ -520,19 +862,25 @@ cdef class VCF(HTSFile):
         cdef int field_index = 0
         cdef int field_type = 0
         cdef int cardinality = 0
-        cdef int meta_index = 0
         cdef int ploidy = 0
         cdef int allele_index = 0
         cdef int index_format = HTS_FMT_CSI
         cdef int index_status = 0
+        cdef int indexed_rid = 0
         cdef int min_shift = 14
         cdef int n_levels = 5
         cdef uint64_t record_count = 0
         cdef uint64_t missing_genotype_alleles = 0
         cdef int64_t record_offset = 0
+        cdef int64_t index_offset = 0
         cdef int64_t final_offset = 0
+        cdef int64_t chunk_start = -1
+        cdef int64_t chunk_final_offset = 0
+        cdef size_t chunk_entry_count = 0
         cdef const char *tag = NULL
         cdef bytes index_path_bytes
+        cdef bytes index_metadata
+        cdef list index_contig_names = []
         cdef bint build_index = False
         cdef bint index_available = False
         cdef bint index_created = False
@@ -540,12 +888,80 @@ cdef class VCF(HTSFile):
         cdef bint is_info
         cdef double numeric_value
         cdef SchemaFieldStats *stats
-        cdef uint8_t tbi_metadata[28]
+        cdef kstring_t chunk_line
+        cdef bint chunked
+        cdef bint collect_chunk_index
+        cdef object chunk_payload = None
+        cdef object chunk_index_stream = None
+        cdef object chunk_config
+
+        chunked = self._schema_chunk is not None
+        collect_chunk_index = self._schema_collect_chunk_index
+        chunk_config = self._schema_chunk
+        if chunked:
+            _chunk_start, _chunk_end, _seek_offset = chunk_config
+            _chunk_index_path = self._schema_chunk_index_path
+        if not isinstance(workers, int) or workers < 1:
+            raise ValueError("workers must be a positive integer")
+        if threads is not None and (not isinstance(threads, int) or threads < 1):
+            raise ValueError("threads must be a positive integer")
+        if workers > 1 and not chunked:
+            if self.fname is None:
+                raise ValueError("parallel schema_scan requires a VCF filename")
+            if b"://" in self.fname:
+                raise ValueError("parallel schema_scan currently requires a local BGZF VCF")
+            index_available = _schema_index_is_available(
+                self.fname, index_path)
+            build_index = index_path is not None and not index_available
+            source_path = os.fsdecode(self.fname)
+            ranges = _schema_bgzf_ranges(
+                source_path, workers)
+            from concurrent.futures import ProcessPoolExecutor
+            from multiprocessing import get_context
+            from tempfile import TemporaryDirectory
+            chunk_summaries = []
+            with TemporaryDirectory(prefix="cyvcf2-schema-scan-") as workdir:
+                tasks = [
+                    (
+                        source_path, start, end, seek, threads,
+                        build_index,
+                        os.path.join(workdir, "chunk-%d.idx" % i)
+                        if build_index else None,
+                    )
+                    for i, (start, end, seek) in enumerate(ranges)
+                ]
+                builder = (
+                    _SchemaIndexBuilder(self.fname, index_path)
+                    if build_index else None
+                )
+                with ProcessPoolExecutor(
+                        max_workers=len(tasks),
+                        mp_context=get_context("spawn")) as pool:
+                    for chunk_summary in pool.map(_schema_scan_worker, tasks):
+                        final_offset = chunk_summary.pop("_final_offset")
+                        if build_index:
+                            builder.add_file(
+                                chunk_summary.pop("_index_entries_path"))
+                        chunk_summaries.append(chunk_summary)
+                if build_index:
+                    builder.finish(final_offset)
+            summary = _merge_schema_scan_summaries(chunk_summaries)
+            if build_index:
+                index_available = True
+                index_created = True
+            summary["index"] = {
+                "available": bool(index_available),
+                "built": bool(index_created),
+                "path": str(index_path) if index_path is not None else None,
+            }
+            return summary
+
+        chunk_line.s = NULL
+        chunk_line.l = 0
+        chunk_line.m = 0
 
         if self.fname is None:
             raise ValueError("schema_scan requires a VCF/BCF filename")
-        if threads is not None and (not isinstance(threads, int) or threads < 1):
-            raise ValueError("threads must be a positive integer")
 
         scan_hts = hts_open(self.fname, b"r")
         if scan_hts == NULL:
@@ -562,12 +978,32 @@ cdef class VCF(HTSFile):
             n_fields = scan_hdr.n[BCF_DT_ID]
             n_contigs = scan_hdr.n[BCF_DT_CTG]
             n_samples = bcf_hdr_nsamples(scan_hdr)
+            if chunked:
+                if not scan_hts.is_bgzf or scan_hts.format.format != vcf:
+                    raise ValueError("parallel schema_scan requires a BGZF-compressed VCF")
+                chunk_start = (
+                    bgzf_tell(scan_hts.fp.bgzf)
+                    if _chunk_start is None or _chunk_start < 0
+                    else _chunk_start
+                )
+                if _seek_offset is not None and _seek_offset >= 0:
+                    if bgzf_seek(scan_hts.fp.bgzf, _seek_offset, 0) < 0:
+                        raise IOError("cannot seek to BGZF chunk")
+                if collect_chunk_index:
+                    if _chunk_index_path is None:
+                        raise ValueError("parallel index scan requires an index-entry path")
+                    chunk_index_stream = open(_chunk_index_path, "wb")
+                    chunk_entry_capacity = 65536
+                    chunk_entries = <SchemaIndexEntry *>stdlib.malloc(
+                        chunk_entry_capacity * sizeof(SchemaIndexEntry))
+                    if chunk_entries == NULL:
+                        raise MemoryError()
             field_stats = <SchemaFieldStats *>stdlib.calloc(
                 <size_t>(2 * n_fields), sizeof(SchemaFieldStats))
             if field_stats == NULL and n_fields > 0:
                 raise MemoryError()
 
-            if index_path is not None:
+            if not chunked and index_path is not None:
                 index_path_bytes = to_bytes(str(index_path) if isinstance(index_path, Path) else index_path)
                 if index_path_bytes == self.fname:
                     raise ValueError("index_path must differ from the input path")
@@ -586,7 +1022,7 @@ cdef class VCF(HTSFile):
                         build_index = True
                 else:
                     build_index = True
-            elif scan_hts.format.format == bcf:
+            elif not chunked and scan_hts.format.format == bcf:
                 if (b"://" in self.fname or
                         os.path.exists(self.fname + b".csi")):
                     existing_index = bcf_index_load(self.fname)
@@ -594,11 +1030,15 @@ cdef class VCF(HTSFile):
                         index_available = True
                         hts_idx_destroy(existing_index)
                         existing_index = NULL
-            else:
+            elif not chunked:
                 if (b"://" in self.fname or
                         os.path.exists(self.fname + b".csi") or
                         os.path.exists(self.fname + b".tbi")):
                     existing_tbx = tbx_index_load(self.fname)
+                    if (existing_tbx == NULL and
+                            os.path.exists(self.fname + b".csi")):
+                        existing_tbx = tbx_index_load2(
+                            self.fname, self.fname + b".csi")
                     if existing_tbx != NULL:
                         index_available = True
                         tbx_destroy(existing_tbx)
@@ -610,41 +1050,86 @@ cdef class VCF(HTSFile):
                 if index_format == HTS_FMT_TBI and scan_hts.format.format != vcf:
                     raise ValueError("TBI indexes can only be created for VCF files")
                 index = hts_idx_init(
-                    n_contigs, index_format, <uint64_t>bgzf_tell(scan_hts.fp.bgzf),
+                    0 if scan_hts.format.format == vcf else n_contigs,
+                    index_format, <uint64_t>bgzf_tell(scan_hts.fp.bgzf),
                     min_shift, n_levels)
                 if index == NULL:
                     raise MemoryError("unable to initialize index")
-                if index_format == HTS_FMT_TBI:
-                    memcpy(tbi_metadata, &tbx_conf_vcf, sizeof(tbx_conf_t))
-                    for meta_index in range(sizeof(tbx_conf_t), 28):
-                        tbi_metadata[meta_index] = 0
-                    if hts_idx_set_meta(index, 28, tbi_metadata, 1) < 0:
-                        raise MemoryError("unable to set TBI index metadata")
+                if scan_hts.format.format == vcf:
+                    index_rid_map = <int *>stdlib.malloc(
+                        <size_t>n_contigs * sizeof(int))
+                    if index_rid_map == NULL and n_contigs > 0:
+                        raise MemoryError("unable to allocate contig mapping")
                     for field_index in range(n_contigs):
-                        tag = bcf_hdr_int2id(scan_hdr, BCF_DT_CTG, field_index)
-                        if tag == NULL or hts_idx_tbi_name(index, field_index, tag) < 0:
-                            raise ValueError("unable to add contig name to TBI index")
-
+                        index_rid_map[field_index] = -1
             record = bcf_init()
             if record == NULL:
                 raise MemoryError("unable to initialize VCF record")
             while True:
-                if build_index:
+                if build_index or chunked:
                     record_offset = bgzf_tell(scan_hts.fp.bgzf)
-                with nogil:
-                    ret = bcf_read(scan_hts, scan_hdr, record)
-                if ret == -1:
+                if chunked and record_offset >= _chunk_end:
                     break
-                if ret < 0:
-                    raise IOError("error reading VCF/BCF record (error-code: %d)" % ret)
+                if chunked:
+                    with nogil:
+                        ret = bgzf_getline(scan_hts.fp.bgzf, 10, &chunk_line)
+                    if ret < 0:
+                        if ret == -1:
+                            break
+                        raise IOError("error reading VCF chunk")
+                    if record_offset < chunk_start:
+                        continue
+                    with nogil:
+                        ret = vcf_parse(&chunk_line, scan_hdr, record)
+                    if ret != 0:
+                        raise IOError("unable to parse VCF record in BGZF chunk")
+                with nogil:
+                    if not chunked:
+                        ret = bcf_read(scan_hts, scan_hdr, record)
+                if not chunked:
+                    if ret == -1:
+                        break
+                    if ret < 0:
+                        raise IOError("error reading VCF/BCF record (error-code: %d)" % ret)
 
+                if build_index or collect_chunk_index:
+                    index_offset = bgzf_tell(scan_hts.fp.bgzf)
+                    if index_offset < 0:
+                        raise IOError("unable to read BGZF virtual offset")
                 if build_index:
-                    if record.rid < 0 or hts_idx_push(
-                            index, record.rid, record.pos,
-                            record.pos + record.rlen, <uint64_t>record_offset, 1) < 0:
+                    indexed_rid = record.rid
+                    if indexed_rid < 0 or indexed_rid >= n_contigs:
+                        raise ValueError(
+                            "cannot index a record with an undefined contig")
+                    if scan_hts.format.format == vcf:
+                        if index_rid_map[indexed_rid] < 0:
+                            index_rid_map[indexed_rid] = len(index_contig_names)
+                            tag = bcf_hdr_int2id(
+                                scan_hdr, BCF_DT_CTG, indexed_rid)
+                            if tag == NULL:
+                                raise ValueError("unable to read VCF contig name")
+                            index_contig_names.append(<bytes>tag)
+                        indexed_rid = index_rid_map[indexed_rid]
+                    if hts_idx_push(
+                            index, indexed_rid, record.pos,
+                            record.pos + record.rlen, <uint64_t>index_offset, 1) < 0:
                         raise ValueError(
                             "cannot build index: records must have defined contigs "
                             "and be coordinate-sorted")
+                if collect_chunk_index:
+                    if record.rid < 0:
+                        raise ValueError("cannot index a record with an undefined contig")
+                    if chunk_entry_count == chunk_entry_capacity:
+                        chunk_payload = PyBytes_FromStringAndSize(
+                            <char *>chunk_entries,
+                            <Py_ssize_t>(chunk_entry_count * sizeof(SchemaIndexEntry)))
+                        chunk_index_stream.write(chunk_payload)
+                        chunk_entry_count = 0
+                    chunk_entries[chunk_entry_count].rid = record.rid
+                    chunk_entries[chunk_entry_count].beg = record.pos
+                    chunk_entries[chunk_entry_count].end = record.pos + record.rlen
+                    chunk_entries[chunk_entry_count].offset = <uint64_t>index_offset
+                    chunk_entry_count += 1
 
                 if bcf_unpack(record, 15) != 0:
                     raise IOError("unable to unpack VCF/BCF record")
@@ -822,10 +1307,27 @@ cdef class VCF(HTSFile):
                             ploidy_capacity = ploidy
                         ploidy_counts[ploidy] += 1
 
+            if chunked:
+                chunk_final_offset = bgzf_tell(scan_hts.fp.bgzf)
+                if collect_chunk_index:
+                    if chunk_entry_count:
+                        chunk_payload = PyBytes_FromStringAndSize(
+                            <char *>chunk_entries,
+                            <Py_ssize_t>(chunk_entry_count * sizeof(SchemaIndexEntry)))
+                        chunk_index_stream.write(chunk_payload)
+                    chunk_index_stream.close()
+                    chunk_index_stream = None
             if build_index:
                 final_offset = bgzf_tell(scan_hts.fp.bgzf)
                 if final_offset < 0 or hts_idx_finish(index, <uint64_t>final_offset) != 0:
                     raise ValueError("unable to finish index; input may not be coordinate-sorted")
+                if scan_hts.format.format == vcf:
+                    index_metadata = _schema_vcf_index_metadata(
+                        index_contig_names)
+                    if hts_idx_set_meta(
+                            index, len(index_metadata),
+                            <uint8_t *>PyBytes_AS_STRING(index_metadata), 1) < 0:
+                        raise MemoryError("unable to set tabix index metadata")
                 index_status = hts_idx_save_as(
                     index, self.fname, index_path_bytes, index_format)
                 if index_status < 0:
@@ -898,6 +1400,10 @@ cdef class VCF(HTSFile):
                     "path": from_bytes(index_path_bytes) if index_path is not None else None,
                 },
             }
+            if chunked:
+                summary["_final_offset"] = chunk_final_offset
+                if collect_chunk_index:
+                    summary["_index_entries_path"] = _chunk_index_path
             return summary
         finally:
             if record != NULL:
@@ -916,9 +1422,14 @@ cdef class VCF(HTSFile):
             stdlib.free(genotypes)
             stdlib.free(int_values)
             stdlib.free(float_values)
+            stdlib.free(index_rid_map)
             stdlib.free(allele_counts)
             stdlib.free(alleles_per_record)
             stdlib.free(ploidy_counts)
+            stdlib.free(chunk_entries)
+            ks_free(&chunk_line)
+            if chunk_index_stream is not None:
+                chunk_index_stream.close()
 
     def _bcf_region(VCF self, region):
         if self.hidx == NULL:
@@ -1023,8 +1534,15 @@ cdef class VCF(HTSFile):
             yield from self._bcf_region(region)
             return
 
+        if self.hidx != NULL:
+            yield from self._bcf_region(region)
+            return
+
         if self.idx == NULL:
             self.idx = tbx_index_load(to_bytes(self.fname))
+            if self.idx == NULL:
+                csi_path = to_bytes(self.fname) + b".csi"
+                self.idx = tbx_index_load2(to_bytes(self.fname), csi_path)
             assert self.idx != NULL, "error loading tabix index for %s" % self.fname
 
         bregion = to_bytes(region)

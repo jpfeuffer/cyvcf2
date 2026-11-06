@@ -39,7 +39,9 @@ cdef extern from "htslib/hfile.h":
 cdef extern from "htslib/bgzf.h":
     ctypedef struct BGZF:
         pass
-    int64_t bgzf_tell(BGZF *fp)
+    int64_t bgzf_tell(BGZF *fp) nogil
+    int64_t bgzf_seek(BGZF *fp, int64_t pos, int whence) nogil
+    int bgzf_getline(BGZF *fp, int delim, kstring_t *str) nogil
 
 cdef extern from "htslib/hts.h":
 

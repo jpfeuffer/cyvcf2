@@ -4,6 +4,7 @@ import platform
 import tempfile
 import sys
 import os
+import shutil
 import atexit
 try:
   from pathlib import Path
@@ -1481,6 +1482,7 @@ def test_schema_scan_summary():
 def test_schema_scan_builds_csi_and_tbi_indexes(tmp_path):
     path = os.path.join(HERE, "multi-contig.vcf.gz")
     expected_records = sum(1 for _ in VCF(path))
+    first_record = next(VCF(path))
 
     for suffix in ("csi", "tbi"):
         index_path = str(tmp_path / ("scan." + suffix))
@@ -1495,6 +1497,41 @@ def test_schema_scan_builds_csi_and_tbi_indexes(tmp_path):
         indexed_vcf = VCF(path)
         indexed_vcf.set_index(index_path)
         assert indexed_vcf.num_records == expected_records
+        region = "%s:%d-%d" % (
+            first_record.CHROM, first_record.POS, first_record.POS)
+        assert list(indexed_vcf(region))
+        reused = VCF(path).schema_scan(index_path=index_path)
+        assert reused["index"] == {
+            "available": True,
+            "built": False,
+            "path": index_path,
+        }
+
+def test_schema_scan_csi_index_is_discovered_for_region_queries(tmp_path):
+    source_path = os.path.join(HERE, "multi-contig.vcf.gz")
+    path = str(tmp_path / "input.vcf.gz")
+    shutil.copyfile(source_path, path)
+    first_record = next(VCF(path))
+    VCF(path).schema_scan(index_path=path + ".csi")
+
+    region = "%s:%d-%d" % (
+        first_record.CHROM, first_record.POS, first_record.POS)
+    assert list(VCF(path)(region))
+
+@pytest.mark.parametrize("suffix", ["csi", "tbi"])
+def test_schema_scan_indexes_only_contigs_with_records(tmp_path, suffix):
+    source = VCF(os.path.join(HERE, "multi-contig.vcf.gz"))
+    record = next(record for record in source if record.CHROM == "20")
+    path = str(tmp_path / "single-contig.vcf.gz")
+    writer = Writer(path, source)
+    writer.write_record(record)
+    writer.close()
+
+    index_path = path + "." + suffix
+    summary = VCF(path).schema_scan(index_path=index_path)
+    assert summary["records"] == 1
+    region = "%s:%d-%d" % (record.CHROM, record.POS, record.POS)
+    assert len(list(VCF(path)(region))) == 1
 
 def test_schema_scan_reuses_existing_index():
     path = VCF_PATH
@@ -1520,6 +1557,35 @@ def test_schema_scan_rejects_unsorted_index_input(tmp_path):
     with pytest.raises(ValueError, match="coordinate-sorted"):
         VCF(output_path).schema_scan(index_path=index_path)
     assert not os.path.exists(index_path)
+
+@pytest.mark.parametrize("suffix", ["csi", "tbi"])
+def test_schema_scan_parallel_workers_builds_index(tmp_path, suffix):
+    path = VCF_PATH
+    expected = VCF(path).schema_scan()
+    index_path = str(tmp_path / ("parallel." + suffix))
+
+    parallel = VCF(path).schema_scan(index_path=index_path, workers=2)
+
+    assert parallel["records"] == expected["records"]
+    assert parallel["samples"] == expected["samples"]
+    assert parallel["alleles_per_record"] == expected["alleles_per_record"]
+    assert parallel["allele_counts"] == expected["allele_counts"]
+    assert parallel["ploidy"] == expected["ploidy"]
+    assert parallel["fields"] == expected["fields"]
+    assert parallel["index"] == {
+        "available": True,
+        "built": True,
+        "path": index_path,
+    }
+    indexed_vcf = VCF(path)
+    indexed_vcf.set_index(index_path)
+    assert indexed_vcf.num_records == expected["records"]
+    reused = VCF(path).schema_scan(index_path=index_path, workers=2)
+    assert reused["index"] == {
+        "available": True,
+        "built": False,
+        "path": index_path,
+    }
 
 def test_schema_scan_includes_unused_header_fields(tmp_path):
     path = tmp_path / "empty.vcf"

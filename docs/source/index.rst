@@ -90,11 +90,19 @@ BCF and TBI for BGZF-compressed VCF. It requires coordinate-sorted input.
 Without ``index_path``, an existing default index is detected but no index is
 created.
 
+For a local BGZF-compressed VCF, pass ``workers`` to scan independent BGZF
+block ranges in parallel. Each worker returns compact summaries and, when an
+index is requested, streams its record offsets to a temporary file. The
+offsets are fed in input order to one in-memory HTSlib index builder; the
+finished CSI/TBI is written after all ranges are processed. ``threads``
+continues to control HTSlib decompression threads per scan.
+
 .. code-block:: python
 
     summary = vcf.schema_scan(
         index_path="variants.vcf.gz.csi",
-        threads=4,
+        workers=4,
+        threads=1,
     )
 
 Modifying Existing Records
