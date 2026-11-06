@@ -2,6 +2,7 @@ out.vcf
 .eggs
 test.vcf
 *.pyc
+.venv/
 cyvcf2.egg-info/
 build
 dist
