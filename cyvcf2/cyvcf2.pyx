@@ -244,6 +244,12 @@ cdef int64_t SCHEMA_BCF_INITIAL_SEARCH = 1 << 20
 cdef int64_t SCHEMA_BCF_MAX_SEARCH = 64 << 20
 
 
+cdef inline int64_t _schema_raw_offset(int64_t offset) nogil:
+    # Uncompressed BGZF streams address bytes as (64 KiB read << 16) | offset;
+    # canonicalize so equal byte positions compare equal.
+    return ((offset >> 16) + (offset & 0xFFFF)) << 16
+
+
 cdef inline uint32_t _schema_u32(const uint8_t *data) nogil:
     return (<uint32_t>data[0] | (<uint32_t>data[1] << 8) |
             (<uint32_t>data[2] << 16) | (<uint32_t>data[3] << 24))
@@ -575,8 +581,8 @@ cdef class _SchemaIndexBuilder:
         if fp == NULL:
             raise IOError("Error opening %s" % path)
         try:
-            if not fp.is_bgzf:
-                raise ValueError("index creation requires BGZF-compressed VCF")
+            if not fp.is_bgzf or fp.format.compression == no_compression:
+                raise ValueError("index creation requires BGZF-compressed VCF/BCF")
             hdr = bcf_hdr_read(fp)
             if hdr == NULL:
                 raise IOError("cannot parse VCF header")
@@ -681,6 +687,15 @@ def _schema_bgzf_ranges(path, int workers):
     file_size = os.path.getsize(path)
     block_offsets = []
     with open(path, "rb") as source:
+        if source.read(4) == b"BCF\x02":
+            # Uncompressed BCF can be split at any byte; workers locate and
+            # verify record starts exactly as for BGZF blocks.
+            boundaries = sorted(set(
+                file_size * worker // workers for worker in range(1, workers)))
+            boundaries = [offset << 16 for offset in boundaries if 0 < offset < file_size]
+            starts = [-1] + boundaries
+            ends = boundaries + [(1 << 63) - 1]
+            return [(start, end, start) for start, end in zip(starts, ends)]
         offset = 0
         while offset < file_size:
             source.seek(offset)
@@ -1132,7 +1147,8 @@ cdef class VCF(HTSFile):
         No index is created when ``index_path`` is ``None``. Index creation
         requires a BGZF-compressed, coordinate-sorted input file.
         ``workers`` parallelizes local BGZF-compressed VCF/BCF scans across
-        independent file ranges. BCF workers locate their first record by
+        independent file ranges, including uncompressed BCF (without indexing).
+        BCF workers locate their first record by
         structural validation; every range start is verified against the
         previous range's end and rescanned from the verified offset if needed. Requested index entries are merged in file
         order and written after all ranges have completed.
@@ -1201,6 +1217,7 @@ cdef class VCF(HTSFile):
         cdef kstring_t chunk_line
         cdef bint chunked
         cdef bint chunked_vcf = False
+        cdef bint raw_chunk = False
         cdef object chunk_actual_start = None
         cdef bint collect_chunk_index
         cdef object chunk_payload = None
@@ -1223,6 +1240,10 @@ cdef class VCF(HTSFile):
             if b"://" in self.fname:
                 raise ValueError("parallel schema_scan currently requires a local BGZF VCF/BCF")
             is_bcf = self.hts.format.format == bcf
+            if (index_path is not None and is_bcf and
+                    self.hts.format.compression == no_compression and
+                    not _schema_index_is_available(self.fname, index_path, is_bcf)):
+                raise ValueError("index creation requires BGZF-compressed VCF/BCF")
             index_available = _schema_index_is_available(
                 self.fname, index_path, is_bcf)
             build_index = index_path is not None and not index_available
@@ -1318,16 +1339,23 @@ cdef class VCF(HTSFile):
                         scan_hts.format.format != bcf):
                     raise ValueError("parallel schema_scan requires a BGZF-compressed VCF/BCF")
                 chunked_vcf = scan_hts.format.format == vcf
+                raw_chunk = scan_hts.format.compression == no_compression
+                if chunked_vcf and raw_chunk:
+                    raise ValueError("parallel schema_scan requires a BGZF-compressed VCF/BCF")
                 chunk_start = (
                     bgzf_tell(scan_hts.fp.bgzf)
                     if _chunk_start is None or _chunk_start < 0
                     else _chunk_start
                 )
+                if raw_chunk:
+                    chunk_start = _schema_raw_offset(chunk_start)
                 chunk_actual_start = chunk_start
                 if not chunked_vcf and _chunk_start is not None and _chunk_start >= 0:
                     if not _exact_start:
                         chunk_start = _schema_bcf_locate_start(
                             scan_hts.fp.bgzf, scan_hdr, _chunk_start)
+                        if raw_chunk and chunk_start >= 0:
+                            chunk_start = _schema_raw_offset(chunk_start)
                         chunk_actual_start = chunk_start if chunk_start >= 0 else None
                         if chunk_start < 0:
                             chunk_start = _chunk_end
@@ -1393,7 +1421,7 @@ cdef class VCF(HTSFile):
                         existing_tbx = NULL
 
             if build_index:
-                if not scan_hts.is_bgzf:
+                if not scan_hts.is_bgzf or scan_hts.format.compression == no_compression:
                     raise ValueError("index creation requires BGZF-compressed VCF/BCF")
                 if index_format == HTS_FMT_TBI and scan_hts.format.format != vcf:
                     raise ValueError("TBI indexes can only be created for VCF files")
@@ -1416,6 +1444,8 @@ cdef class VCF(HTSFile):
             while True:
                 if build_index or chunked:
                     record_offset = bgzf_tell(scan_hts.fp.bgzf)
+                    if raw_chunk:
+                        record_offset = _schema_raw_offset(record_offset)
                 if chunked and not chunked_vcf and chunk_start >= _chunk_end:
                     record_offset = chunk_start
                     break

@@ -101,7 +101,8 @@ BCF has no record sync marker, so each BCF worker locates its first record by
 validating the full binary structure of several consecutive records. Every
 located start is then checked against the exact offset where the previous
 worker stopped; a range whose start does not match is rescanned from the
-verified offset, so results never depend on the heuristic.
+verified offset, so results never depend on the heuristic. Uncompressed BCF
+is split at arbitrary byte positions the same way; it cannot be indexed.
 
 .. code-block:: python
 

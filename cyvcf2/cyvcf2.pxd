@@ -65,8 +65,12 @@ cdef extern from "htslib/hts.h":
         binary_format, text_format,
         sam, bam, bai, cram, crai, vcf, bcf, csi, gzi, tbi, bed
 
+    cdef enum htsCompression:
+        no_compression
+
     ctypedef struct htsFormat:
         htsExactFormat format
+        htsCompression compression
 
     ctypedef struct htsFile:
         int is_bgzf

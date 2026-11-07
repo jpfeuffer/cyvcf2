@@ -1682,6 +1682,26 @@ def test_schema_scan_parallel_bcf_rescans_unverified_starts(tmp_path, monkeypatc
     serial.pop("index")
     assert parallel == serial
 
+def test_schema_scan_parallel_raw_bcf(tmp_path):
+    import gzip
+
+    bgzf_path = _write_multiblock_bcf(tmp_path)
+    raw_path = str(tmp_path / "raw.bcf")
+    with open(bgzf_path, "rb") as source, open(raw_path, "wb") as target:
+        target.write(gzip.decompress(source.read()))
+    serial = VCF(raw_path).schema_scan()
+    assert serial["records"] == 4000
+
+    for workers in (2, 5, 16):
+        assert VCF(raw_path).schema_scan(workers=workers) == serial
+
+    index_path = str(tmp_path / "raw.csi")
+    with pytest.raises(ValueError, match="BGZF"):
+        VCF(raw_path).schema_scan(index_path=index_path)
+    with pytest.raises(ValueError, match="BGZF"):
+        VCF(raw_path).schema_scan(index_path=index_path, workers=2)
+    assert not os.path.exists(index_path)
+
 def test_schema_scan_includes_unused_header_fields(tmp_path):
     path = tmp_path / "empty.vcf"
     path.write_text(
