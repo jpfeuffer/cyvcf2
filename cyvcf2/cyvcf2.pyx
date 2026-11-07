@@ -231,6 +231,308 @@ cdef bytes _schema_vcf_index_metadata(list contig_names):
     ) + names_blob
 
 
+cdef enum:
+    SCHEMA_BCF_INVALID = -1
+    SCHEMA_BCF_TRUNCATED = -2
+    SCHEMA_BCF_MASK_INFO = 1
+    SCHEMA_BCF_MASK_FLT = 2
+    SCHEMA_BCF_MASK_FMT = 4
+
+cdef int64_t SCHEMA_BCF_MAX_BLOCK = 1 << 30
+cdef int SCHEMA_BCF_REQUIRED_RECORDS = 4
+cdef int64_t SCHEMA_BCF_INITIAL_SEARCH = 1 << 20
+cdef int64_t SCHEMA_BCF_MAX_SEARCH = 64 << 20
+
+
+cdef inline uint32_t _schema_u32(const uint8_t *data) nogil:
+    return (<uint32_t>data[0] | (<uint32_t>data[1] << 8) |
+            (<uint32_t>data[2] << 16) | (<uint32_t>data[3] << 24))
+
+
+cdef inline int _schema_bcf_type_size(int value_type) nogil:
+    if value_type == 0:
+        return 0
+    if value_type == 1 or value_type == 7:
+        return 1
+    if value_type == 2:
+        return 2
+    if value_type == 3 or value_type == 5:
+        return 4
+    return -1
+
+
+cdef inline int _schema_bcf_int(
+        const uint8_t *data, int64_t length, int64_t *cursor,
+        int64_t *value) nogil:
+    cdef int descriptor
+    cdef int value_type
+    cdef int size
+    if cursor[0] >= length:
+        return SCHEMA_BCF_TRUNCATED
+    descriptor = data[cursor[0]]
+    value_type = descriptor & 15
+    if descriptor >> 4 != 1 or value_type < 1 or value_type > 3:
+        return SCHEMA_BCF_INVALID
+    size = _schema_bcf_type_size(value_type)
+    if cursor[0] + 1 + size > length:
+        return SCHEMA_BCF_TRUNCATED
+    if value_type == 1:
+        value[0] = <int8_t>data[cursor[0] + 1]
+    elif value_type == 2:
+        value[0] = <int16_t>(
+            <uint16_t>data[cursor[0] + 1] | (<uint16_t>data[cursor[0] + 2] << 8))
+    else:
+        value[0] = <int32_t>_schema_u32(data + cursor[0] + 1)
+    cursor[0] += 1 + size
+    return 0
+
+
+cdef inline int _schema_bcf_typed(
+        const uint8_t *data, int64_t length, int64_t *cursor,
+        int *value_type, int64_t *count) nogil:
+    cdef int descriptor
+    cdef int status
+    if cursor[0] >= length:
+        return SCHEMA_BCF_TRUNCATED
+    descriptor = data[cursor[0]]
+    value_type[0] = descriptor & 15
+    count[0] = descriptor >> 4
+    if _schema_bcf_type_size(value_type[0]) < 0:
+        return SCHEMA_BCF_INVALID
+    cursor[0] += 1
+    if count[0] == 15:
+        status = _schema_bcf_int(data, length, cursor, count)
+        if status != 0:
+            return status
+        if count[0] < 15:
+            return SCHEMA_BCF_INVALID
+    if value_type[0] == 0 and count[0] != 0:
+        return SCHEMA_BCF_INVALID
+    return 0
+
+
+cdef inline int _schema_bcf_skip_typed(
+        const uint8_t *data, int64_t length, int64_t *cursor,
+        int64_t multiplier, int *value_type) nogil:
+    cdef int64_t count
+    cdef int status = _schema_bcf_typed(
+        data, length, cursor, value_type, &count)
+    if status != 0:
+        return status
+    cursor[0] += count * multiplier * _schema_bcf_type_size(value_type[0])
+    if cursor[0] > length:
+        return SCHEMA_BCF_INVALID
+    return 0
+
+
+cdef int64_t _schema_bcf_check_record(
+        const uint8_t *data, int64_t length, int64_t start,
+        int n_contigs, int n_samples, int n_ids,
+        const uint8_t *id_mask) nogil:
+    """Validate the complete structure of one BCF record at ``start``.
+
+    Returns the record length, SCHEMA_BCF_INVALID, or SCHEMA_BCF_TRUNCATED.
+    """
+    cdef int64_t shared_length
+    cdef int64_t indiv_length
+    cdef int64_t cursor
+    cdef int64_t shared_end
+    cdef int64_t indiv_end
+    cdef int64_t key
+    cdef int64_t count
+    cdef int64_t i
+    cdef int64_t j
+    cdef int32_t rid
+    cdef int32_t pos
+    cdef int32_t rlen
+    cdef uint32_t packed
+    cdef int n_info
+    cdef int n_allele
+    cdef int n_fmt
+    cdef int value_type
+    cdef int status
+    cdef int size
+
+    if start + 32 > length:
+        return SCHEMA_BCF_TRUNCATED
+    shared_length = _schema_u32(data + start)
+    indiv_length = _schema_u32(data + start + 4)
+    if (shared_length < 24 or shared_length > SCHEMA_BCF_MAX_BLOCK or
+            indiv_length > SCHEMA_BCF_MAX_BLOCK):
+        return SCHEMA_BCF_INVALID
+    cursor = start + 8
+    rid = <int32_t>_schema_u32(data + cursor)
+    pos = <int32_t>_schema_u32(data + cursor + 4)
+    rlen = <int32_t>_schema_u32(data + cursor + 8)
+    if rid < 0 or rid >= n_contigs or pos < -1 or rlen < 0:
+        return SCHEMA_BCF_INVALID
+    packed = _schema_u32(data + cursor + 16)
+    n_info = packed & 0xffff
+    n_allele = packed >> 16
+    packed = _schema_u32(data + cursor + 20)
+    n_fmt = packed >> 24
+    if <int>(packed & 0xffffff) != n_samples:
+        return SCHEMA_BCF_INVALID
+    if (n_fmt == 0) != (indiv_length == 0):
+        return SCHEMA_BCF_INVALID
+    shared_end = start + 8 + shared_length
+    indiv_end = shared_end + indiv_length
+    if indiv_end > length:
+        return SCHEMA_BCF_TRUNCATED
+    cursor += 24
+
+    status = _schema_bcf_skip_typed(data, shared_end, &cursor, 1, &value_type)
+    if status != 0 or (value_type != 7 and value_type != 0):
+        return SCHEMA_BCF_INVALID
+    for i in range(n_allele):
+        status = _schema_bcf_skip_typed(
+            data, shared_end, &cursor, 1, &value_type)
+        if status != 0 or (value_type != 7 and value_type != 0):
+            return SCHEMA_BCF_INVALID
+    status = _schema_bcf_typed(data, shared_end, &cursor, &value_type, &count)
+    if status != 0 or value_type == 5 or value_type == 7:
+        return SCHEMA_BCF_INVALID
+    size = _schema_bcf_type_size(value_type)
+    if cursor + count * size > shared_end:
+        return SCHEMA_BCF_INVALID
+    for j in range(count):
+        if size == 1:
+            key = <int8_t>data[cursor]
+        elif size == 2:
+            key = <int16_t>(<uint16_t>data[cursor] | (<uint16_t>data[cursor + 1] << 8))
+        else:
+            key = <int32_t>_schema_u32(data + cursor)
+        if key < 0 or key >= n_ids or not (id_mask[key] & SCHEMA_BCF_MASK_FLT):
+            return SCHEMA_BCF_INVALID
+        cursor += size
+    for i in range(n_info):
+        if _schema_bcf_int(data, shared_end, &cursor, &key) != 0:
+            return SCHEMA_BCF_INVALID
+        if key < 0 or key >= n_ids or not (id_mask[key] & SCHEMA_BCF_MASK_INFO):
+            return SCHEMA_BCF_INVALID
+        if _schema_bcf_skip_typed(
+                data, shared_end, &cursor, 1, &value_type) != 0:
+            return SCHEMA_BCF_INVALID
+    if cursor != shared_end:
+        return SCHEMA_BCF_INVALID
+
+    for i in range(n_fmt):
+        if _schema_bcf_int(data, indiv_end, &cursor, &key) != 0:
+            return SCHEMA_BCF_INVALID
+        if key < 0 or key >= n_ids or not (id_mask[key] & SCHEMA_BCF_MASK_FMT):
+            return SCHEMA_BCF_INVALID
+        if _schema_bcf_skip_typed(
+                data, indiv_end, &cursor, n_samples, &value_type) != 0:
+            return SCHEMA_BCF_INVALID
+    if cursor != indiv_end:
+        return SCHEMA_BCF_INVALID
+    return indiv_end - start
+
+
+cdef int64_t _schema_bcf_find_record_start(
+        const uint8_t *data, int64_t length, bint at_eof,
+        int n_contigs, int n_samples, int n_ids,
+        const uint8_t *id_mask) nogil:
+    """Return the first offset that begins a chain of valid BCF records.
+
+    Returns SCHEMA_BCF_INVALID if no candidate exists in ``data`` and
+    SCHEMA_BCF_TRUNCATED if more decompressed data is needed to decide.
+    """
+    cdef int64_t candidate
+    cdef int64_t cursor
+    cdef int64_t record_length
+    cdef int records
+
+    for candidate in range(length):
+        cursor = candidate
+        records = 0
+        while records < SCHEMA_BCF_REQUIRED_RECORDS:
+            if at_eof and cursor == length:
+                break
+            record_length = _schema_bcf_check_record(
+                data, length, cursor, n_contigs, n_samples, n_ids, id_mask)
+            if record_length == SCHEMA_BCF_TRUNCATED and not at_eof:
+                return SCHEMA_BCF_TRUNCATED
+            if record_length < 0:
+                break
+            cursor += record_length
+            records += 1
+        if records == SCHEMA_BCF_REQUIRED_RECORDS or (
+                records > 0 and at_eof and cursor == length):
+            return candidate
+    return SCHEMA_BCF_INVALID
+
+
+cdef int64_t _schema_bcf_locate_start(
+        BGZF *fp, bcf_hdr_t *hdr, int64_t block_start) except -2:
+    """Find the virtual offset of the first BCF record starting in a block.
+
+    Returns -1 when no record start could be identified within the search
+    budget; the caller then relies on the previous chunk's verified handoff.
+    """
+    cdef int n_ids = hdr.n[BCF_DT_ID]
+    cdef int n_contigs = hdr.n[BCF_DT_CTG]
+    cdef int n_samples = bcf_hdr_nsamples(hdr)
+    cdef uint8_t *id_mask = NULL
+    cdef uint8_t *data = NULL
+    cdef uint8_t *resized = NULL
+    cdef int64_t capacity = 0
+    cdef int64_t length = 0
+    cdef int64_t candidate = SCHEMA_BCF_TRUNCATED
+    cdef int64_t target
+    cdef ssize_t got
+    cdef bint at_eof = False
+    cdef int i
+
+    id_mask = <uint8_t *>stdlib.calloc(<size_t>max(n_ids, 1), 1)
+    if id_mask == NULL:
+        raise MemoryError()
+    try:
+        for i in range(n_ids):
+            if bcf_hdr_idinfo_exists(hdr, BCF_HL_INFO, i):
+                id_mask[i] |= SCHEMA_BCF_MASK_INFO
+            if bcf_hdr_idinfo_exists(hdr, BCF_HL_FLT, i):
+                id_mask[i] |= SCHEMA_BCF_MASK_FLT
+            if bcf_hdr_idinfo_exists(hdr, BCF_HL_FMT, i):
+                id_mask[i] |= SCHEMA_BCF_MASK_FMT
+        if bgzf_seek(fp, block_start, 0) < 0:
+            raise IOError("cannot seek to BGZF chunk")
+        target = SCHEMA_BCF_INITIAL_SEARCH
+        while candidate == SCHEMA_BCF_TRUNCATED:
+            if target > capacity:
+                resized = <uint8_t *>stdlib.realloc(data, <size_t>target)
+                if resized == NULL:
+                    raise MemoryError()
+                data = resized
+                capacity = target
+            with nogil:
+                got = bgzf_read(fp, data + length, <size_t>(target - length))
+            if got < 0:
+                raise IOError("error reading BCF chunk")
+            length += got
+            at_eof = length < target
+            with nogil:
+                candidate = _schema_bcf_find_record_start(
+                    data, length, at_eof, n_contigs, n_samples, n_ids, id_mask)
+            if candidate == SCHEMA_BCF_TRUNCATED:
+                if target >= SCHEMA_BCF_MAX_SEARCH:
+                    return -1
+                target *= 2
+        if candidate < 0:
+            return -1
+        if bgzf_seek(fp, block_start, 0) < 0:
+            raise IOError("cannot seek to BGZF chunk")
+        if candidate > 0:
+            with nogil:
+                got = bgzf_read(fp, data, <size_t>candidate)
+            if got != candidate:
+                raise IOError("error reading BCF chunk")
+        return bgzf_tell(fp)
+    finally:
+        stdlib.free(id_mask)
+        stdlib.free(data)
+
+
 cdef class _SchemaIndexBuilder:
     cdef hts_idx_t *index
     cdef bytes fname
@@ -241,6 +543,7 @@ cdef class _SchemaIndexBuilder:
     cdef list header_contig_names
     cdef list contig_names
     cdef int index_format
+    cdef bint is_bcf
     cdef bint finished
 
     def __cinit__(self, path, index_path):
@@ -281,6 +584,7 @@ cdef class _SchemaIndexBuilder:
                 raise ValueError("TBI indexes can only be created for VCF files")
             n_contigs = hdr.n[BCF_DT_CTG]
             self.n_contigs = n_contigs
+            self.is_bcf = fp.format.format == bcf
             self.rid_map = <int *>stdlib.malloc(
                 <size_t>n_contigs * sizeof(int))
             if self.rid_map == NULL and n_contigs > 0:
@@ -294,8 +598,8 @@ cdef class _SchemaIndexBuilder:
                 self.header_contig_names.append(<bytes>contig_name)
             offset0 = bgzf_tell(fp.fp.bgzf)
             self.index = hts_idx_init(
-                0, self.index_format, <uint64_t>offset0,
-                min_shift, n_levels)
+                n_contigs if self.is_bcf else 0, self.index_format,
+                <uint64_t>offset0, min_shift, n_levels)
             if self.index == NULL:
                 raise MemoryError("unable to initialize index")
         finally:
@@ -327,7 +631,7 @@ cdef class _SchemaIndexBuilder:
                     entry = entries[entry_index]
                     if entry.rid < 0 or entry.rid >= self.n_contigs:
                         raise ValueError("invalid contig ID in index entries")
-                    mapped_rid = self.rid_map[entry.rid]
+                    mapped_rid = entry.rid if self.is_bcf else self.rid_map[entry.rid]
                     if mapped_rid < 0:
                         mapped_rid = self.next_rid
                         self.rid_map[entry.rid] = mapped_rid
@@ -351,11 +655,12 @@ cdef class _SchemaIndexBuilder:
         if final_offset < 0 or hts_idx_finish(
                 self.index, <uint64_t>final_offset) != 0:
             raise ValueError("unable to finish index; input may not be coordinate-sorted")
-        metadata = _schema_vcf_index_metadata(self.contig_names)
-        if hts_idx_set_meta(
-                self.index, len(metadata),
-                <uint8_t *>PyBytes_AS_STRING(metadata), 1) < 0:
-            raise MemoryError("unable to set tabix index metadata")
+        if not self.is_bcf:
+            metadata = _schema_vcf_index_metadata(self.contig_names)
+            if hts_idx_set_meta(
+                    self.index, len(metadata),
+                    <uint8_t *>PyBytes_AS_STRING(metadata), 1) < 0:
+                raise MemoryError("unable to set tabix index metadata")
         ret = hts_idx_save_as(
             self.index, self.fname, self.index_path, self.index_format)
         if ret < 0:
@@ -430,16 +735,18 @@ def _schema_bgzf_ranges(path, int workers):
 
 
 def _schema_scan_worker(args):
-    path, start, end, seek, threads, collect_index, index_entries_path = args
+    (path, start, end, seek, threads, collect_index, index_entries_path,
+     exact_start) = args
     reader = VCF(path)
     try:
         return reader._schema_scan_chunk(
-            start, end, seek, threads, collect_index, index_entries_path)
+            start, end, seek, threads, collect_index, index_entries_path,
+            exact_start)
     finally:
         reader.close()
 
 
-def _schema_index_is_available(path, index_path=None):
+def _schema_index_is_available(path, index_path=None, is_bcf=False):
     cdef bytes fname = to_bytes(path)
     cdef bytes idxname
     cdef hts_idx_t *index = NULL
@@ -453,7 +760,7 @@ def _schema_index_is_available(path, index_path=None):
             raise ValueError("index_path must differ from the input path")
         if not os.path.exists(index_path):
             return False
-        if idxname.endswith((b".tbi", b".csi")):
+        if not is_bcf and idxname.endswith((b".tbi", b".csi")):
             tbx = tbx_index_load2(fname, idxname)
             if tbx != NULL:
                 tbx_destroy(tbx)
@@ -465,11 +772,11 @@ def _schema_index_is_available(path, index_path=None):
                 return True
         raise OSError("unable to read existing index: %s" % index_path)
 
-    candidates = [fname + b".csi", fname + b".tbi"]
+    candidates = [fname + b".csi"] if is_bcf else [fname + b".csi", fname + b".tbi"]
     for idxname in candidates:
         if not os.path.exists(idxname):
             continue
-        if idxname.endswith((b".tbi", b".csi")):
+        if not is_bcf:
             tbx = tbx_index_load2(fname, idxname)
             if tbx != NULL:
                 tbx_destroy(tbx)
@@ -805,8 +1112,9 @@ cdef class VCF(HTSFile):
           raise OSError("unable to open index:'%s' for '%s'" % (index_path, self.fname))
 
     def _schema_scan_chunk(
-            self, start, end, seek, threads, collect_index, index_entries_path):
-        self._schema_chunk = (start, end, seek)
+            self, start, end, seek, threads, collect_index, index_entries_path,
+            exact_start=False):
+        self._schema_chunk = (start, end, seek, exact_start)
         self._schema_collect_chunk_index = collect_index
         self._schema_chunk_index_path = index_entries_path
         try:
@@ -823,8 +1131,10 @@ cdef class VCF(HTSFile):
         where an index will be built during this scan if it does not exist.
         No index is created when ``index_path`` is ``None``. Index creation
         requires a BGZF-compressed, coordinate-sorted input file.
-        ``workers`` parallelizes local BGZF-compressed VCF scans across
-        independent file ranges. Requested index entries are merged in file
+        ``workers`` parallelizes local BGZF-compressed VCF/BCF scans across
+        independent file ranges. BCF workers locate their first record by
+        structural validation; every range start is verified against the
+        previous range's end and rescanned from the verified offset if needed. Requested index entries are merged in file
         order and written after all ranges have completed.
         """
         cdef htsFile *scan_hts = NULL
@@ -890,6 +1200,8 @@ cdef class VCF(HTSFile):
         cdef SchemaFieldStats *stats
         cdef kstring_t chunk_line
         cdef bint chunked
+        cdef bint chunked_vcf = False
+        cdef object chunk_actual_start = None
         cdef bint collect_chunk_index
         cdef object chunk_payload = None
         cdef object chunk_index_stream = None
@@ -899,7 +1211,7 @@ cdef class VCF(HTSFile):
         collect_chunk_index = self._schema_collect_chunk_index
         chunk_config = self._schema_chunk
         if chunked:
-            _chunk_start, _chunk_end, _seek_offset = chunk_config
+            _chunk_start, _chunk_end, _seek_offset, _exact_start = chunk_config
             _chunk_index_path = self._schema_chunk_index_path
         if not isinstance(workers, int) or workers < 1:
             raise ValueError("workers must be a positive integer")
@@ -909,13 +1221,16 @@ cdef class VCF(HTSFile):
             if self.fname is None:
                 raise ValueError("parallel schema_scan requires a VCF filename")
             if b"://" in self.fname:
-                raise ValueError("parallel schema_scan currently requires a local BGZF VCF")
+                raise ValueError("parallel schema_scan currently requires a local BGZF VCF/BCF")
+            is_bcf = self.hts.format.format == bcf
             index_available = _schema_index_is_available(
-                self.fname, index_path)
+                self.fname, index_path, is_bcf)
             build_index = index_path is not None and not index_available
             source_path = os.fsdecode(self.fname)
             ranges = _schema_bgzf_ranges(
                 source_path, workers)
+            if is_bcf:
+                ranges = [(start, end, start) for start, end, _ in ranges]
             from concurrent.futures import ProcessPoolExecutor
             from multiprocessing import get_context
             from tempfile import TemporaryDirectory
@@ -927,6 +1242,7 @@ cdef class VCF(HTSFile):
                         build_index,
                         os.path.join(workdir, "chunk-%d.idx" % i)
                         if build_index else None,
+                        False,
                     )
                     for i, (start, end, seek) in enumerate(ranges)
                 ]
@@ -937,7 +1253,25 @@ cdef class VCF(HTSFile):
                 with ProcessPoolExecutor(
                         max_workers=len(tasks),
                         mp_context=get_context("spawn")) as pool:
-                    for chunk_summary in pool.map(_schema_scan_worker, tasks):
+                    futures = [
+                        pool.submit(_schema_scan_worker, task)
+                        for task in tasks
+                    ]
+                    expected_start = None
+                    for i, future in enumerate(futures):
+                        chunk_summary = future.result()
+                        if (is_bcf and i > 0 and
+                                chunk_summary["_actual_start"] != expected_start):
+                            # The located start disagrees with where the
+                            # previous range ended; rescan from the verified offset.
+                            task = list(tasks[i])
+                            task[1] = expected_start
+                            task[3] = expected_start
+                            task[7] = True
+                            chunk_summary = pool.submit(
+                                _schema_scan_worker, tuple(task)).result()
+                        expected_start = chunk_summary.pop("_next_start")
+                        chunk_summary.pop("_actual_start")
                         final_offset = chunk_summary.pop("_final_offset")
                         if build_index:
                             builder.add_file(
@@ -979,14 +1313,28 @@ cdef class VCF(HTSFile):
             n_contigs = scan_hdr.n[BCF_DT_CTG]
             n_samples = bcf_hdr_nsamples(scan_hdr)
             if chunked:
-                if not scan_hts.is_bgzf or scan_hts.format.format != vcf:
-                    raise ValueError("parallel schema_scan requires a BGZF-compressed VCF")
+                if not scan_hts.is_bgzf or (
+                        scan_hts.format.format != vcf and
+                        scan_hts.format.format != bcf):
+                    raise ValueError("parallel schema_scan requires a BGZF-compressed VCF/BCF")
+                chunked_vcf = scan_hts.format.format == vcf
                 chunk_start = (
                     bgzf_tell(scan_hts.fp.bgzf)
                     if _chunk_start is None or _chunk_start < 0
                     else _chunk_start
                 )
-                if _seek_offset is not None and _seek_offset >= 0:
+                chunk_actual_start = chunk_start
+                if not chunked_vcf and _chunk_start is not None and _chunk_start >= 0:
+                    if not _exact_start:
+                        chunk_start = _schema_bcf_locate_start(
+                            scan_hts.fp.bgzf, scan_hdr, _chunk_start)
+                        chunk_actual_start = chunk_start if chunk_start >= 0 else None
+                        if chunk_start < 0:
+                            chunk_start = _chunk_end
+                    if chunk_start < _chunk_end:
+                        if bgzf_seek(scan_hts.fp.bgzf, chunk_start, 0) < 0:
+                            raise IOError("cannot seek to BCF record")
+                elif _seek_offset is not None and _seek_offset >= 0:
                     if bgzf_seek(scan_hts.fp.bgzf, _seek_offset, 0) < 0:
                         raise IOError("cannot seek to BGZF chunk")
                 if collect_chunk_index:
@@ -1068,9 +1416,12 @@ cdef class VCF(HTSFile):
             while True:
                 if build_index or chunked:
                     record_offset = bgzf_tell(scan_hts.fp.bgzf)
+                if chunked and not chunked_vcf and chunk_start >= _chunk_end:
+                    record_offset = chunk_start
+                    break
                 if chunked and record_offset >= _chunk_end:
                     break
-                if chunked:
+                if chunked_vcf:
                     with nogil:
                         ret = bgzf_getline(scan_hts.fp.bgzf, 10, &chunk_line)
                     if ret < 0:
@@ -1084,9 +1435,9 @@ cdef class VCF(HTSFile):
                     if ret != 0:
                         raise IOError("unable to parse VCF record in BGZF chunk")
                 with nogil:
-                    if not chunked:
+                    if not chunked_vcf:
                         ret = bcf_read(scan_hts, scan_hdr, record)
-                if not chunked:
+                if not chunked_vcf:
                     if ret == -1:
                         break
                     if ret < 0:
@@ -1402,6 +1753,8 @@ cdef class VCF(HTSFile):
             }
             if chunked:
                 summary["_final_offset"] = chunk_final_offset
+                summary["_actual_start"] = chunk_actual_start
+                summary["_next_start"] = record_offset
                 if collect_chunk_index:
                     summary["_index_entries_path"] = _chunk_index_path
             return summary

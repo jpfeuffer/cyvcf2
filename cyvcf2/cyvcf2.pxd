@@ -1,4 +1,4 @@
-from libc.stdint cimport int64_t, uint64_t, int32_t, uint32_t, int8_t, int16_t, uint8_t
+from libc.stdint cimport int64_t, uint64_t, int32_t, uint32_t, int8_t, int16_t, uint8_t, uint16_t
 import numpy as np
 cimport numpy as np
 np.import_array()
@@ -42,6 +42,7 @@ cdef extern from "htslib/bgzf.h":
     int64_t bgzf_tell(BGZF *fp) nogil
     int64_t bgzf_seek(BGZF *fp, int64_t pos, int whence) nogil
     int bgzf_getline(BGZF *fp, int delim, kstring_t *str) nogil
+    ssize_t bgzf_read(BGZF *fp, void *data, size_t length) nogil
 
 cdef extern from "htslib/hts.h":
 
@@ -297,6 +298,7 @@ cdef extern from "htslib/vcf.h":
     const char *bcf_hdr_int2id(const bcf_hdr_t *hdr, int type, int int_id)
     int bcf_hdr_id2int(const bcf_hdr_t *hdr, int type, const char *id);
     int bcf_hdr_id2type(bcf_hdr_t * hdr,int type, int int_id)
+    int bcf_hdr_idinfo_exists(bcf_hdr_t * hdr, int type, int int_id)
 
     int bcf_unpack(bcf1_t *b, int which) nogil;
 

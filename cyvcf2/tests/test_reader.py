@@ -1587,6 +1587,101 @@ def test_schema_scan_parallel_workers_builds_index(tmp_path, suffix):
         "path": index_path,
     }
 
+def _write_multiblock_bcf(tmp_path, n_records=4000, n_samples=40):
+    vcf_path = tmp_path / "multiblock.vcf"
+    samples = ["s%d" % i for i in range(n_samples)]
+    lines = [
+        "##fileformat=VCFv4.2",
+        "##contig=<ID=1>",
+        "##contig=<ID=2>",
+        '##FILTER=<ID=LowQ,Description="low quality">',
+        '##INFO=<ID=DP,Number=1,Type=Integer,Description="depth">',
+        '##INFO=<ID=AF,Number=A,Type=Float,Description="frequency">',
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="genotype">',
+        '##FORMAT=<ID=AD,Number=R,Type=Integer,Description="depths">',
+        "\t".join(["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER",
+                   "INFO", "FORMAT"] + samples),
+    ]
+    for i in range(n_records):
+        chrom = "1" if i < n_records // 2 else "2"
+        alts = ",".join(["T", "G", "CA"][:1 + i % 3])
+        n_alts = 1 + i % 3
+        genotypes = [
+            "%d/%d:%s" % (s % (n_alts + 1), (s + i) % (n_alts + 1),
+                          ",".join(str(s + i + k) for k in range(n_alts + 1)))
+            for s in range(n_samples)
+        ]
+        lines.append("\t".join([
+            chrom, str(10 * i + 1), "rs%d" % i, "A", alts, str(i % 99),
+            "LowQ" if i % 7 == 0 else "PASS",
+            "DP=%d;AF=%s" % (i, ",".join(["0.5"] * n_alts)), "GT:AD",
+        ] + genotypes))
+    vcf_path.write_text("\n".join(lines) + "\n")
+    source = VCF(str(vcf_path))
+    bcf_path = str(tmp_path / "multiblock.bcf")
+    writer = Writer(bcf_path, source, mode="wb")
+    for record in source:
+        writer.write_record(record)
+    writer.close()
+    return bcf_path
+
+def test_schema_scan_parallel_bcf_matches_serial(tmp_path):
+    path = _write_multiblock_bcf(tmp_path)
+    serial_index = str(tmp_path / "serial.csi")
+    serial = VCF(path).schema_scan(index_path=serial_index)
+    serial.pop("index")
+    assert serial["records"] == 4000
+
+    for workers in (2, 5, 16):
+        index_path = str(tmp_path / ("parallel-%d.csi" % workers))
+        parallel = VCF(path).schema_scan(index_path=index_path, workers=workers)
+        assert parallel.pop("index") == {
+            "available": True,
+            "built": True,
+            "path": index_path,
+        }
+        assert parallel == serial
+        with open(index_path, "rb") as a, open(serial_index, "rb") as b:
+            assert a.read() == b.read()
+
+    indexed = VCF(path)
+    indexed.set_index(serial_index)
+    assert len(list(indexed("1:1-100"))) == 10
+    assert len(list(indexed("2:20001-20101"))) == 11
+    reused = VCF(path).schema_scan(index_path=serial_index, workers=4)
+    assert reused["index"]["built"] is False
+
+def test_schema_scan_parallel_bcf_rescans_unverified_starts(tmp_path, monkeypatch):
+    import concurrent.futures
+    import cyvcf2.cyvcf2 as cyvcf2_module
+
+    path = _write_multiblock_bcf(tmp_path)
+    serial = VCF(path).schema_scan()
+    original_worker = cyvcf2_module._schema_scan_worker
+    exact_rescans = []
+
+    def corrupting_worker(args):
+        exact_start = args[7]
+        if exact_start:
+            exact_rescans.append(args[1])
+        summary = original_worker(args)
+        if not exact_start and args[1] >= 0:
+            summary["_actual_start"] = None
+        return summary
+
+    class InProcessPool(concurrent.futures.ThreadPoolExecutor):
+        def __init__(self, max_workers=None, mp_context=None):
+            super().__init__(max_workers)
+
+    monkeypatch.setattr(cyvcf2_module, "_schema_scan_worker", corrupting_worker)
+    monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", InProcessPool)
+    parallel = VCF(path).schema_scan(workers=4)
+
+    assert exact_rescans
+    parallel.pop("index")
+    serial.pop("index")
+    assert parallel == serial
+
 def test_schema_scan_includes_unused_header_fields(tmp_path):
     path = tmp_path / "empty.vcf"
     path.write_text(

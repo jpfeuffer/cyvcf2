@@ -2,7 +2,7 @@
 + drop support for end-of-life Python 3.8 (minimum is now 3.9)
 + add PyPI trove classifiers (Python 3.9–3.14)
 + bump cibuildwheel to v4 and drop the stale prerelease-pythons flag
-+ add native schema scanning, parallel BGZF workers, and optional index creation
++ add native schema scanning, parallel BGZF VCF/BCF workers, and optional index creation
 
 # v0.33.0
 + modernize build system to use scikit-build-core (thanks @jhl-oai #327)
