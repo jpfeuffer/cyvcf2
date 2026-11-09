@@ -539,6 +539,49 @@ cdef int64_t _schema_bcf_locate_start(
         stdlib.free(data)
 
 
+cdef void _schema_index_settings(
+        const bcf_hdr_t *hdr, bint is_bcf, int index_format,
+        int *min_shift, int *n_levels) except *:
+    cdef int i
+    cdef uint64_t max_length = 0
+    cdef uint64_t max_position
+
+    min_shift[0] = 14
+    n_levels[0] = 5
+    if index_format == HTS_FMT_TBI:
+        return
+    for i in range(hdr.n[BCF_DT_CTG]):
+        if hdr.id[BCF_DT_CTG][i].val != NULL:
+            max_length = max(max_length, hdr.id[BCF_DT_CTG][i].val.info[0])
+
+    # Match HTSlib's bcf_index/tbx_index policies, including unknown lengths.
+    if is_bcf:
+        n_levels[0] = 0
+        if max_length == 0:
+            max_length = (<uint64_t>1 << 31) - 1
+    else:
+        n_levels[0] = 6
+        if max_length == 0:
+            n_levels[0] = 8
+            return
+
+    if max_length > (<uint64_t>1 << 62) - 256:
+        raise ValueError("contig length exceeds the supported CSI coordinate range")
+    max_length += 256
+    max_position = <uint64_t>1 << (min_shift[0] + 3 * n_levels[0])
+    while max_length > max_position:
+        if n_levels[0] < 9:
+            n_levels[0] += 1
+            max_position <<= 3
+        else:
+            min_shift[0] += 1
+            max_position <<= 1
+    if min_shift[0] != 14:
+        warnings.warn(
+            "Adjusted CSI min_shift from 14 to %d due to the longest contig"
+            % min_shift[0], RuntimeWarning)
+
+
 cdef class _SchemaIndexBuilder:
     cdef hts_idx_t *index
     cdef bytes fname
@@ -603,6 +646,8 @@ cdef class _SchemaIndexBuilder:
                     raise ValueError("unable to read VCF contig name")
                 self.header_contig_names.append(<bytes>contig_name)
             offset0 = bgzf_tell(fp.fp.bgzf)
+            _schema_index_settings(
+                hdr, self.is_bcf, self.index_format, &min_shift, &n_levels)
             self.index = hts_idx_init(
                 n_contigs if self.is_bcf else 0, self.index_format,
                 <uint64_t>offset0, min_shift, n_levels)
@@ -687,15 +732,29 @@ def _schema_bgzf_ranges(path, int workers):
     file_size = os.path.getsize(path)
     block_offsets = []
     with open(path, "rb") as source:
-        if source.read(4) == b"BCF\x02":
-            # Uncompressed BCF can be split at any byte; workers locate and
+        magic = source.read(4)
+        if magic[:2] != b"\x1f\x8b":
+            # Uncompressed BCF/VCF can be split at any byte; workers locate and
             # verify record starts exactly as for BGZF blocks.
+            data_start = 0
+            if magic != b"BCF\x02":
+                source.seek(0)
+                for line in source:
+                    if not line.startswith(b"#"):
+                        break
+                    data_start += len(line)
             boundaries = sorted(set(
-                file_size * worker // workers for worker in range(1, workers)))
-            boundaries = [offset << 16 for offset in boundaries if 0 < offset < file_size]
-            starts = [-1] + boundaries
-            ends = boundaries + [(1 << 63) - 1]
-            return [(start, end, start) for start, end in zip(starts, ends)]
+                data_start + (file_size - data_start) * worker // workers
+                for worker in range(1, workers)))
+            boundaries = [offset for offset in boundaries if data_start < offset < file_size]
+            starts = [-1] + [offset << 16 for offset in boundaries]
+            ends = [offset << 16 for offset in boundaries] + [(1 << 63) - 1]
+            # Text workers seek one byte early to tell whether the boundary
+            # already starts a line.
+            return [
+                (start, end, -1 if start < 0 else ((start >> 16) - 1) << 16)
+                for start, end in zip(starts, ends)
+            ]
         offset = 0
         while offset < file_size:
             source.seek(offset)
@@ -1139,16 +1198,23 @@ cdef class VCF(HTSFile):
             self._schema_collect_chunk_index = False
             self._schema_chunk_index_path = None
 
-    def schema_scan(self, index_path=None, threads=None, workers=1):
+    def schema_scan(self, index_path=None, threads=None, workers=None):
         """Scan the complete VCF/BCF and return compact field statistics.
 
         ``index_path`` may name an existing index to reuse, or a destination
         where an index will be built during this scan if it does not exist.
         No index is created when ``index_path`` is ``None``. Index creation
         requires a BGZF-compressed, coordinate-sorted input file.
-        ``workers`` parallelizes local BGZF-compressed VCF/BCF scans across
-        independent file ranges, including uncompressed BCF (without indexing).
-        BCF workers locate their first record by
+        ``threads=0`` opts into automatic concurrency: half the available CPU
+        budget (honoring affinity and Linux cgroups) is used for workers,
+        each with one decompression thread. A one-CPU budget decodes
+        synchronously. An explicit ``workers`` overrides automatic selection.
+        Otherwise ``workers`` defaults to one and positive ``threads`` sets
+        the number of HTSlib decompression threads per worker.
+        ``workers`` parallelizes local BGZF-compressed or uncompressed VCF/BCF
+        scans across independent file ranges (indexing requires BGZF).
+        VCF workers start at the first line in their range; BCF workers locate
+        their first record by
         structural validation; every range start is verified against the
         previous range's end and rescanned from the verified offset if needed. Requested index entries are merged in file
         order and written after all ranges have completed.
@@ -1215,6 +1281,10 @@ cdef class VCF(HTSFile):
         cdef double numeric_value
         cdef SchemaFieldStats *stats
         cdef kstring_t chunk_line
+        cdef BGZF *chunk_fp = NULL
+        cdef BGZF *text_fp = NULL
+        cdef int64_t header_end = 0
+        cdef bint chunk_start_found = False
         cdef bint chunked
         cdef bint chunked_vcf = False
         cdef bint raw_chunk = False
@@ -1230,17 +1300,29 @@ cdef class VCF(HTSFile):
         if chunked:
             _chunk_start, _chunk_end, _seek_offset, _exact_start = chunk_config
             _chunk_index_path = self._schema_chunk_index_path
-        if not isinstance(workers, int) or workers < 1:
+        if workers is not None and (not isinstance(workers, int) or workers < 1):
             raise ValueError("workers must be a positive integer")
-        if threads is not None and (not isinstance(threads, int) or threads < 1):
-            raise ValueError("threads must be a positive integer")
+        if threads is not None and (not isinstance(threads, int) or threads < 0):
+            raise ValueError("threads must be a non-negative integer")
+        if threads == 0:
+            from ._schema_scan import _available_cpu_count
+            cpu_budget = _available_cpu_count()
+            if workers is None:
+                workers = (
+                    max(1, cpu_budget // 2)
+                    if self.fname is not None and b"://" not in self.fname
+                    else 1
+                )
+            threads = 1 if cpu_budget >= 2 else None
+        if workers is None:
+            workers = 1
         if workers > 1 and not chunked:
             if self.fname is None:
                 raise ValueError("parallel schema_scan requires a VCF filename")
             if b"://" in self.fname:
                 raise ValueError("parallel schema_scan currently requires a local BGZF VCF/BCF")
             is_bcf = self.hts.format.format == bcf
-            if (index_path is not None and is_bcf and
+            if (index_path is not None and
                     self.hts.format.compression == no_compression and
                     not _schema_index_is_available(self.fname, index_path, is_bcf)):
                 raise ValueError("index creation requires BGZF-compressed VCF/BCF")
@@ -1281,7 +1363,7 @@ cdef class VCF(HTSFile):
                     expected_start = None
                     for i, future in enumerate(futures):
                         chunk_summary = future.result()
-                        if (is_bcf and i > 0 and
+                        if (i > 0 and
                                 chunk_summary["_actual_start"] != expected_start):
                             # The located start disagrees with where the
                             # previous range ended; rescan from the verified offset.
@@ -1334,16 +1416,27 @@ cdef class VCF(HTSFile):
             n_contigs = scan_hdr.n[BCF_DT_CTG]
             n_samples = bcf_hdr_nsamples(scan_hdr)
             if chunked:
-                if not scan_hts.is_bgzf or (
-                        scan_hts.format.format != vcf and
-                        scan_hts.format.format != bcf):
-                    raise ValueError("parallel schema_scan requires a BGZF-compressed VCF/BCF")
+                if scan_hts.format.format != vcf and scan_hts.format.format != bcf:
+                    raise ValueError("parallel schema_scan requires a VCF/BCF")
                 chunked_vcf = scan_hts.format.format == vcf
                 raw_chunk = scan_hts.format.compression == no_compression
-                if chunked_vcf and raw_chunk:
-                    raise ValueError("parallel schema_scan requires a BGZF-compressed VCF/BCF")
+                if not scan_hts.is_bgzf and not (chunked_vcf and raw_chunk):
+                    raise ValueError("parallel schema_scan requires a BGZF-compressed or uncompressed VCF/BCF")
+                if scan_hts.is_bgzf:
+                    chunk_fp = scan_hts.fp.bgzf
+                    header_end = bgzf_tell(chunk_fp)
+                else:
+                    # Plain-text VCF: BGZF passes uncompressed data through
+                    # with seekable (canonicalized) virtual offsets.
+                    header_end = htell(scan_hts.fp.hfile) << 16
+                    text_fp = bgzf_open(self.fname, b"r")
+                    if text_fp == NULL:
+                        raise IOError("Error opening %s" % self.fname)
+                    chunk_fp = text_fp
+                if raw_chunk:
+                    header_end = _schema_raw_offset(header_end)
                 chunk_start = (
-                    bgzf_tell(scan_hts.fp.bgzf)
+                    header_end
                     if _chunk_start is None or _chunk_start < 0
                     else _chunk_start
                 )
@@ -1353,18 +1446,29 @@ cdef class VCF(HTSFile):
                 if not chunked_vcf and _chunk_start is not None and _chunk_start >= 0:
                     if not _exact_start:
                         chunk_start = _schema_bcf_locate_start(
-                            scan_hts.fp.bgzf, scan_hdr, _chunk_start)
+                            chunk_fp, scan_hdr, _chunk_start)
                         if raw_chunk and chunk_start >= 0:
                             chunk_start = _schema_raw_offset(chunk_start)
                         chunk_actual_start = chunk_start if chunk_start >= 0 else None
                         if chunk_start < 0:
                             chunk_start = _chunk_end
                     if chunk_start < _chunk_end:
-                        if bgzf_seek(scan_hts.fp.bgzf, chunk_start, 0) < 0:
+                        if bgzf_seek(chunk_fp, chunk_start, 0) < 0:
                             raise IOError("cannot seek to BCF record")
-                elif _seek_offset is not None and _seek_offset >= 0:
-                    if bgzf_seek(scan_hts.fp.bgzf, _seek_offset, 0) < 0:
-                        raise IOError("cannot seek to BGZF chunk")
+                elif chunked_vcf:
+                    if chunk_start < header_end:
+                        chunk_start = header_end
+                    # The actual start is the first line at or after chunk_start.
+                    chunk_actual_start = None
+                    if _exact_start:
+                        _seek_offset = chunk_start
+                    if _seek_offset is not None and _seek_offset >= 0 and _seek_offset < chunk_start:
+                        if bgzf_seek(chunk_fp, _seek_offset, 0) < 0:
+                            raise IOError("cannot seek to VCF chunk")
+                    elif ((_schema_raw_offset(bgzf_tell(chunk_fp)) if raw_chunk
+                           else bgzf_tell(chunk_fp)) != chunk_start and
+                          bgzf_seek(chunk_fp, chunk_start, 0) < 0):
+                        raise IOError("cannot seek to VCF chunk")
                 if collect_chunk_index:
                     if _chunk_index_path is None:
                         raise ValueError("parallel index scan requires an index-entry path")
@@ -1425,6 +1529,9 @@ cdef class VCF(HTSFile):
                     raise ValueError("index creation requires BGZF-compressed VCF/BCF")
                 if index_format == HTS_FMT_TBI and scan_hts.format.format != vcf:
                     raise ValueError("TBI indexes can only be created for VCF files")
+                _schema_index_settings(
+                    scan_hdr, scan_hts.format.format == bcf, index_format,
+                    &min_shift, &n_levels)
                 index = hts_idx_init(
                     0 if scan_hts.format.format == vcf else n_contigs,
                     index_format, <uint64_t>bgzf_tell(scan_hts.fp.bgzf),
@@ -1441,19 +1548,24 @@ cdef class VCF(HTSFile):
             record = bcf_init()
             if record == NULL:
                 raise MemoryError("unable to initialize VCF record")
+            if chunk_fp == NULL and scan_hts.is_bgzf:
+                chunk_fp = scan_hts.fp.bgzf
             while True:
                 if build_index or chunked:
-                    record_offset = bgzf_tell(scan_hts.fp.bgzf)
+                    record_offset = bgzf_tell(chunk_fp)
                     if raw_chunk:
                         record_offset = _schema_raw_offset(record_offset)
                 if chunked and not chunked_vcf and chunk_start >= _chunk_end:
                     record_offset = chunk_start
                     break
+                if chunked_vcf and not chunk_start_found and record_offset >= chunk_start:
+                    chunk_start_found = True
+                    chunk_actual_start = record_offset
                 if chunked and record_offset >= _chunk_end:
                     break
                 if chunked_vcf:
                     with nogil:
-                        ret = bgzf_getline(scan_hts.fp.bgzf, 10, &chunk_line)
+                        ret = bgzf_getline(chunk_fp, 10, &chunk_line)
                     if ret < 0:
                         if ret == -1:
                             break
@@ -1463,7 +1575,7 @@ cdef class VCF(HTSFile):
                     with nogil:
                         ret = vcf_parse(&chunk_line, scan_hdr, record)
                     if ret != 0:
-                        raise IOError("unable to parse VCF record in BGZF chunk")
+                        raise IOError("unable to parse VCF record in chunk")
                 with nogil:
                     if not chunked_vcf:
                         ret = bcf_read(scan_hts, scan_hdr, record)
@@ -1474,7 +1586,7 @@ cdef class VCF(HTSFile):
                         raise IOError("error reading VCF/BCF record (error-code: %d)" % ret)
 
                 if build_index or collect_chunk_index:
-                    index_offset = bgzf_tell(scan_hts.fp.bgzf)
+                    index_offset = bgzf_tell(chunk_fp)
                     if index_offset < 0:
                         raise IOError("unable to read BGZF virtual offset")
                 if build_index:
@@ -1689,7 +1801,7 @@ cdef class VCF(HTSFile):
                         ploidy_counts[ploidy] += 1
 
             if chunked:
-                chunk_final_offset = bgzf_tell(scan_hts.fp.bgzf)
+                chunk_final_offset = bgzf_tell(chunk_fp)
                 if collect_chunk_index:
                     if chunk_entry_count:
                         chunk_payload = PyBytes_FromStringAndSize(
@@ -1801,6 +1913,8 @@ cdef class VCF(HTSFile):
                 bcf_hdr_destroy(scan_hdr)
             if scan_hts != NULL:
                 hts_close(scan_hts)
+            if text_fp != NULL:
+                bgzf_close(text_fp)
             stdlib.free(field_stats)
             stdlib.free(genotypes)
             stdlib.free(int_values)

@@ -35,10 +35,13 @@ cdef extern from "htslib/hfile.h":
     ctypedef struct hFILE:
         pass
     hFILE *hdopen(int fd, const char *mode);
+    int64_t htell(hFILE *fp) nogil
 
 cdef extern from "htslib/bgzf.h":
     ctypedef struct BGZF:
         pass
+    BGZF *bgzf_open(const char *path, const char *mode)
+    int bgzf_close(BGZF *fp)
     int64_t bgzf_tell(BGZF *fp) nogil
     int64_t bgzf_seek(BGZF *fp, int64_t pos, int whence) nogil
     int bgzf_getline(BGZF *fp, int delim, kstring_t *str) nogil
@@ -220,8 +223,11 @@ cdef extern from "htslib/vcf.h":
         int unpack_size[3];    # // the original block size of ID, REF+ALT and FILTER
         int errcode;   # // one of BCF_ERR_* codes
 
+    ctypedef struct bcf_idinfo_t:
+        uint64_t info[3]
+
     ctypedef struct bcf_idpair_t:
-        pass
+        const bcf_idinfo_t *val
 
     cdef extern const int BCF_HL_FLT; # header line
     cdef extern const int BCF_HL_INFO;

@@ -97,12 +97,31 @@ offsets are fed in input order to one in-memory HTSlib index builder; the
 finished CSI/TBI is written after all ranges are processed. ``threads``
 continues to control HTSlib decompression threads per scan.
 
+Use ``threads=0`` for automatic concurrency. For local files, the default is
+``max(1, available_cpus // 2)`` workers, each with one decompression thread
+alongside its parsing thread. CPU availability accounts for process affinity,
+Linux cgroup v1/v2 CPU quotas (including visible ancestor limits), and cpusets;
+fractional CPU quotas are rounded down, with a minimum of one CPU. HTSlib also
+creates an I/O helper thread, so this is a CPU-budget heuristic rather than a
+strict OS-thread limit. Uncompressed inputs need no decompression threads.
+With a one-CPU budget, decoding is synchronous. Remote inputs retain a single
+worker. Explicit ``workers`` overrides automatic selection, even if it exceeds
+the detected budget. Without ``threads=0``, the default remains a serial scan;
+positive ``threads`` values retain their per-worker decompression meaning.
+
+CSI indexes use HTSlib's format-specific depth selection from the declared
+contig lengths, with the same fallback when lengths are unknown. The smallest
+bins span 16,384 bases by default; exceptionally long contigs require larger
+bins. TBI retains its fixed 512 Mi-base coordinate limit per contig.
+
 BCF has no record sync marker, so each BCF worker locates its first record by
 validating the full binary structure of several consecutive records. Every
 located start is then checked against the exact offset where the previous
 worker stopped; a range whose start does not match is rescanned from the
-verified offset, so results never depend on the heuristic. Uncompressed BCF
-is split at arbitrary byte positions the same way; it cannot be indexed.
+verified offset, so results never depend on the heuristic. VCF workers start at
+the first line in their range and use the same handoff check. Uncompressed
+VCF and BCF are split at arbitrary byte positions the same way; they cannot be
+indexed.
 
 .. code-block:: python
 

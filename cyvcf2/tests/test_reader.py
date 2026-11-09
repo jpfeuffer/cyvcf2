@@ -1587,13 +1587,74 @@ def test_schema_scan_parallel_workers_builds_index(tmp_path, suffix):
         "path": index_path,
     }
 
-def _write_multiblock_bcf(tmp_path, n_records=4000, n_samples=40):
+@pytest.mark.parametrize("cpu_budget,explicit_workers,expected_workers", [
+    (1, None, 1),
+    (2, None, 1),
+    (3, None, 1),
+    (8, None, 4),
+    (12, None, 6),
+    (12, 2, 2),
+    (12, 1, 1),
+])
+def test_schema_scan_auto_concurrency(
+        monkeypatch, cpu_budget, explicit_workers, expected_workers):
+    import concurrent.futures
+    import cyvcf2.cyvcf2 as cyvcf2_module
+    from cyvcf2 import _schema_scan as resources
+
+    monkeypatch.setattr(resources, "_available_cpu_count", lambda: cpu_budget)
+    original_ranges = cyvcf2_module._schema_bgzf_ranges
+    original_worker = cyvcf2_module._schema_scan_worker
+    selected_workers = []
+    selected_threads = []
+
+    def recording_ranges(path, workers):
+        selected_workers.append(workers)
+        return original_ranges(path, workers)
+
+    def recording_worker(args):
+        selected_threads.append(args[4])
+        return original_worker(args)
+
+    class InProcessPool(concurrent.futures.ThreadPoolExecutor):
+        def __init__(self, max_workers=None, mp_context=None):
+            super().__init__(max_workers)
+
+    monkeypatch.setattr(cyvcf2_module, "_schema_bgzf_ranges", recording_ranges)
+    monkeypatch.setattr(cyvcf2_module, "_schema_scan_worker", recording_worker)
+    monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", InProcessPool)
+    expected = VCF(VCF_PATH).schema_scan()
+    kwargs = {} if explicit_workers is None else {"workers": explicit_workers}
+    assert VCF(VCF_PATH).schema_scan(threads=0, **kwargs) == expected
+    assert selected_workers == ([expected_workers] if expected_workers > 1 else [])
+    if selected_threads:
+        assert set(selected_threads) == {1}
+
+
+@pytest.mark.parametrize("threads", [-1, 1.5, "0"])
+def test_schema_scan_invalid_threads(threads):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        VCF(VCF_PATH).schema_scan(threads=threads)
+
+def test_schema_scan_auto_process_workers(tmp_path, monkeypatch):
+    from cyvcf2 import _schema_scan as resources
+
+    monkeypatch.setattr(resources, "_available_cpu_count", lambda: 4)
+    bcf_path = _write_multiblock_bcf(tmp_path)
+    for path in (bcf_path, str(tmp_path / "multiblock.vcf")):
+        assert VCF(path).schema_scan(threads=0) == VCF(path).schema_scan()
+
+
+def _write_multiblock_bcf(
+        tmp_path, n_records=4000, n_samples=40, contig_length=None, start_position=1):
     vcf_path = tmp_path / "multiblock.vcf"
     samples = ["s%d" % i for i in range(n_samples)]
     lines = [
         "##fileformat=VCFv4.2",
-        "##contig=<ID=1>",
-        "##contig=<ID=2>",
+        "##contig=<ID=1%s>" % (
+            ",length=%d" % contig_length if contig_length is not None else ""),
+        "##contig=<ID=2%s>" % (
+            ",length=%d" % contig_length if contig_length is not None else ""),
         '##FILTER=<ID=LowQ,Description="low quality">',
         '##INFO=<ID=DP,Number=1,Type=Integer,Description="depth">',
         '##INFO=<ID=AF,Number=A,Type=Float,Description="frequency">',
@@ -1612,7 +1673,7 @@ def _write_multiblock_bcf(tmp_path, n_records=4000, n_samples=40):
             for s in range(n_samples)
         ]
         lines.append("\t".join([
-            chrom, str(10 * i + 1), "rs%d" % i, "A", alts, str(i % 99),
+            chrom, str(10 * i + start_position), "rs%d" % i, "A", alts, str(i % 99),
             "LowQ" if i % 7 == 0 else "PASS",
             "DP=%d;AF=%s" % (i, ",".join(["0.5"] * n_alts)), "GT:AD",
         ] + genotypes))
@@ -1624,6 +1685,76 @@ def _write_multiblock_bcf(tmp_path, n_records=4000, n_samples=40):
         writer.write_record(record)
     writer.close()
     return bcf_path
+
+@pytest.mark.parametrize("is_bcf", [False, True])
+@pytest.mark.parametrize("contig_length,vcf_depth,bcf_depth", [
+    (None, 8, 6),
+    (100000, 6, 1),
+    ((1 << 29) - 256, 6, 5),
+    ((1 << 29) - 255, 6, 6),
+    (1 << 32, 7, 7),
+])
+def test_schema_scan_csi_depth_matches_htslib(
+        tmp_path, is_bcf, contig_length, vcf_depth, bcf_depth):
+    import ctypes
+    import gzip
+    import struct
+    import cyvcf2.cyvcf2 as cyvcf2_module
+
+    start_position = (1 << 29) + 1 if contig_length == 1 << 32 else 1
+    bcf_path = _write_multiblock_bcf(
+        tmp_path, contig_length=contig_length, start_position=start_position)
+    if is_bcf:
+        path = bcf_path
+    else:
+        path = str(tmp_path / "multiblock.vcf.gz")
+        with VCF(str(tmp_path / "multiblock.vcf")) as source:
+            writer = Writer(path, source, mode="wz")
+            for record in source:
+                writer.write_record(record)
+            writer.close()
+
+    serial_index = str(tmp_path / "serial.csi")
+    parallel_index = str(tmp_path / "parallel.csi")
+    reference_index = str(tmp_path / "reference.csi")
+    serial = VCF(path).schema_scan(index_path=serial_index)
+    parallel = VCF(path).schema_scan(index_path=parallel_index, workers=4, threads=1)
+    serial.pop("index")
+    parallel.pop("index")
+    assert serial == parallel
+
+    native_build = ctypes.CDLL(cyvcf2_module.__file__).bcf_index_build3
+    native_build.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
+                             ctypes.c_int, ctypes.c_int]
+    native_build.restype = ctypes.c_int
+    assert native_build(os.fsencode(path), os.fsencode(reference_index), 14, 0) == 0
+    expected_bytes = (tmp_path / "reference.csi").read_bytes()
+    assert (tmp_path / "serial.csi").read_bytes() == expected_bytes
+    assert (tmp_path / "parallel.csi").read_bytes() == expected_bytes
+    assert struct.unpack("<4sii", gzip.decompress(expected_bytes)[:12]) == (
+        b"CSI\x01", 14, bcf_depth if is_bcf else vcf_depth)
+    with VCF(path) as indexed:
+        indexed.set_index(parallel_index)
+        assert len(list(indexed("2:%d-%d" % (
+            start_position + 29999, start_position + 34999)))) == 500
+
+
+def test_schema_scan_tbi_matches_htslib(tmp_path):
+    import ctypes
+    import cyvcf2.cyvcf2 as cyvcf2_module
+
+    reference_index = str(tmp_path / "reference.tbi")
+    native_build = ctypes.CDLL(cyvcf2_module.__file__).bcf_index_build3
+    native_build.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
+                             ctypes.c_int, ctypes.c_int]
+    native_build.restype = ctypes.c_int
+    assert native_build(os.fsencode(VCF_PATH), os.fsencode(reference_index), 0, 0) == 0
+    expected_bytes = (tmp_path / "reference.tbi").read_bytes()
+    for workers in (1, 4):
+        index_path = tmp_path / ("scan-%d.tbi" % workers)
+        VCF(VCF_PATH).schema_scan(index_path=str(index_path), workers=workers)
+        assert index_path.read_bytes() == expected_bytes
+
 
 def test_schema_scan_parallel_bcf_matches_serial(tmp_path):
     path = _write_multiblock_bcf(tmp_path)
@@ -1701,6 +1832,57 @@ def test_schema_scan_parallel_raw_bcf(tmp_path):
     with pytest.raises(ValueError, match="BGZF"):
         VCF(raw_path).schema_scan(index_path=index_path, workers=2)
     assert not os.path.exists(index_path)
+
+def test_schema_scan_parallel_plain_vcf(tmp_path):
+    _write_multiblock_bcf(tmp_path)
+    path = str(tmp_path / "multiblock.vcf")
+    serial = VCF(path).schema_scan()
+    assert serial["records"] == 4000
+
+    for workers in (2, 5, 16, 64):
+        assert VCF(path).schema_scan(workers=workers) == serial
+
+    index_path = str(tmp_path / "plain.csi")
+    with pytest.raises(ValueError, match="BGZF"):
+        VCF(path).schema_scan(index_path=index_path, workers=2)
+    assert not os.path.exists(index_path)
+
+@pytest.mark.parametrize("plain", [False, True])
+def test_schema_scan_parallel_vcf_handoffs(tmp_path, monkeypatch, plain):
+    import concurrent.futures
+    import cyvcf2.cyvcf2 as cyvcf2_module
+
+    if plain:
+        _write_multiblock_bcf(tmp_path)
+        path = str(tmp_path / "multiblock.vcf")
+    else:
+        path = VCF_PATH
+    serial = VCF(path).schema_scan()
+    original_worker = cyvcf2_module._schema_scan_worker
+    exact_rescans = []
+    corrupt = []
+
+    def recording_worker(args):
+        exact_start = args[7]
+        if exact_start:
+            exact_rescans.append(args[1])
+        summary = original_worker(args)
+        if corrupt and not exact_start and args[1] >= 0:
+            summary["_actual_start"] = None
+        return summary
+
+    class InProcessPool(concurrent.futures.ThreadPoolExecutor):
+        def __init__(self, max_workers=None, mp_context=None):
+            super().__init__(max_workers)
+
+    monkeypatch.setattr(cyvcf2_module, "_schema_scan_worker", recording_worker)
+    monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", InProcessPool)
+    assert VCF(path).schema_scan(workers=4) == serial
+    assert not exact_rescans
+
+    corrupt.append(True)
+    assert VCF(path).schema_scan(workers=4) == serial
+    assert exact_rescans
 
 def test_schema_scan_includes_unused_header_fields(tmp_path):
     path = tmp_path / "empty.vcf"
