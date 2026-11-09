@@ -881,6 +881,66 @@ def get_gt_str(variant, key="GT"):
     idx = variant.FORMAT.index(key)
     return [x.split(":")[idx] for x in str(variant).strip().split("\t")[9:]]
 
+@pytest.mark.parametrize("gts012", [False, True])
+@pytest.mark.parametrize("first_phased", [False, True])
+@pytest.mark.parametrize("calls", [["0"], ["."], ["0", "1", ".", "1"]])
+def test_haploid_phase_accessors(tmp_path, calls, first_phased, gts012):
+    path = tmp_path / "haploid.vcf"
+    samples = ["sample{}".format(i) for i in range(len(calls))]
+    path.write_text(
+        '##fileformat=VCFv4.2\n'
+        '##contig=<ID=1>\n'
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t'
+        + '\t'.join(samples) + '\n'
+        '1\t1\t.\tA\tC\t.\tPASS\t.\tGT\t' + '\t'.join(calls) + '\n'
+    )
+    with VCF(path, gts012=gts012) as vcf:
+        variant = next(vcf)
+        genotype = variant.genotype
+        phases = [first_phased if i % 2 == 0 else not first_phased
+                  for i in range(len(calls))]
+        for i, phased in enumerate(phases):
+            genotype[i][0].phased = phased
+        variant.genotype = genotype
+
+        alleles = [-1 if call == "." else int(call) for call in calls]
+        assert variant.genotypes == [
+            [allele, phased] for allele, phased in zip(alleles, phases)
+        ]
+        genotype = variant.genotype
+        assert [genotype.phased(i) for i in range(len(calls))] == phases
+        np.testing.assert_array_equal(
+            genotype.array(), list(zip(alleles, phases))
+        )
+        np.testing.assert_array_equal(variant.gt_phases, phases)
+
+
+@pytest.mark.parametrize("calls, expected", [
+    (["1/2", "0|1|2"], [[1, 2, False], [0, 1, 2, True]]),
+    (["1|2", "0/1/2"], [[1, 2, True], [0, 1, 2, False]]),
+    (["./.", "0|1|2"], [[-1, -1, False], [0, 1, 2, True]]),
+    (["0/1|2", "0|1/2"], [[0, 1, 2, False], [0, 1, 2, True]]),
+])
+def test_mixed_ploidy_phase_accessors(tmp_path, calls, expected):
+    path = tmp_path / "mixed-ploidy.vcf"
+    path.write_text(
+        '##fileformat=VCFv4.2\n'
+        '##contig=<ID=1>\n'
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n'
+        '1\t1\t.\tA\tC,G\t.\tPASS\t.\tGT\t' + '\t'.join(calls) + '\n'
+    )
+    with VCF(path) as vcf:
+        variant = next(vcf)
+        assert variant.genotypes == expected
+        phases = [gt[-1] for gt in expected]
+        genotype = variant.genotype
+        assert [genotype.phased(i) for i in range(2)] == phases
+        np.testing.assert_array_equal(genotype.array()[:, -1], phases)
+        np.testing.assert_array_equal(variant.gt_phases, phases)
+
+
 def test_access_gts():
     vcf = VCF('{}/test-format-string.vcf'.format(HERE))
     """

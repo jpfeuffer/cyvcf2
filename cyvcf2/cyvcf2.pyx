@@ -1221,7 +1221,7 @@ cdef class Genotypes(object):
         """
         a boolean indicating that the ith sample is phased.
         """
-        return (self._raw[i * self.ploidy + self.ploidy - 1] & 1) == 1
+        return (self._raw[i * self.ploidy + (1 if self.ploidy > 1 else 0)] & 1) == 1
 
     def alleles(self, int i):
         cdef list result = []
@@ -1259,7 +1259,7 @@ cdef class Genotypes(object):
                     to_return[ind, allele] = fill
                 else:
                     to_return[ind, allele] = (raw >> 1) - 1
-            to_return[ind, self.ploidy] = (self._raw[ind * self.ploidy + self.ploidy - 1] & 1) == 1
+            to_return[ind, self.ploidy] = self.phased(ind)
 
         return to_return
 
@@ -1603,7 +1603,7 @@ cdef class Variant(object):
                       break
                   self._genotypes[i].append(bcf_gt_allele(gts[k + j]))
               self._genotypes[i].append(
-                    bool(bcf_gt_is_phased(gts[k + nret - 1])))
+                    bool(bcf_gt_is_phased(gts[k + (1 if nret > 1 else 0)])))
 
             stdlib.free(gts)
             return self._genotypes
@@ -1713,7 +1713,8 @@ cdef class Variant(object):
                         else:
                             self._gt_idxs[k] = a
 
-                    self._gt_phased[j] = self._gt_types[i] > 0 and <int>bcf_gt_is_phased(self._gt_types[i+1])
+                    self._gt_phased[j] = self._gt_types[i] > 0 and <int>bcf_gt_is_phased(
+                        self._gt_types[i + (1 if nper > 1 else 0)])
                     j += 1
 
                 if self.vcf.gts012:
