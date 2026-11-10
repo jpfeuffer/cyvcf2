@@ -33,7 +33,7 @@ from cpython.ref cimport Py_INCREF
 from cpython.version cimport PY_MAJOR_VERSION
 from cpython.bytes cimport (
     PyBytes_FromStringAndSize,
-    PyBytes_AS_STRING,
+    PyBytes_AsString,
 )
 
 def set_htslib_log_level(int level):
@@ -701,7 +701,7 @@ cdef class _SchemaIndexBuilder:
                     break
                 if len(payload) % sizeof(SchemaIndexEntry) != 0:
                     raise IOError("invalid chunk index entry file")
-                entries = <SchemaIndexEntry *>PyBytes_AS_STRING(payload)
+                entries = <SchemaIndexEntry *>PyBytes_AsString(payload)
                 entry_count = len(payload) // sizeof(SchemaIndexEntry)
                 for entry_index in range(entry_count):
                     entry = entries[entry_index]
@@ -734,7 +734,7 @@ cdef class _SchemaIndexBuilder:
             metadata = _schema_vcf_index_metadata(self.contig_names)
             if hts_idx_set_meta(
                     self.index, len(metadata),
-                    <uint8_t *>PyBytes_AS_STRING(metadata), 1) < 0:
+                    <uint8_t *>PyBytes_AsString(metadata), 1) < 0:
                 raise MemoryError("unable to set tabix index metadata")
         _schema_save_index(self.index, self.fname, self.index_path, self.index_format)
         self.finished = True
@@ -1994,7 +1994,7 @@ cdef class VCF(HTSFile):
                         index_contig_names)
                     if hts_idx_set_meta(
                             index, len(index_metadata),
-                            <uint8_t *>PyBytes_AS_STRING(index_metadata), 1) < 0:
+                            <uint8_t *>PyBytes_AsString(index_metadata), 1) < 0:
                         raise MemoryError("unable to set tabix index metadata")
                 _schema_save_index(index, self.fname, index_path_bytes, index_format)
                 index_available = True

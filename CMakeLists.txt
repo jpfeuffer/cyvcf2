@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20...3.30)
+cmake_minimum_required(VERSION 3.26...3.30)
 
 project(${SKBUILD_PROJECT_NAME} LANGUAGES C)
 
@@ -12,7 +12,7 @@ if(SKBUILD_STATE STREQUAL "sdist")
   return()
 endif()
 
-find_package(Python COMPONENTS Interpreter Development.Module NumPy REQUIRED)
+find_package(Python COMPONENTS Interpreter Development.Module NumPy ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
 set(CYVCF2_HTSLIB_CONFIGURE_OPTIONS "$ENV{CYVCF2_HTSLIB_CONFIGURE_OPTIONS}" CACHE STRING "Extra options passed to htslib configure")
 set(CYVCF2_HTSLIB_MODE "$ENV{CYVCF2_HTSLIB_MODE}" CACHE STRING "How to link htslib: BUILTIN or EXTERNAL")
@@ -222,7 +222,12 @@ else()
   endif()
 endif()
 
-Python_add_library(cyvcf2_extension MODULE WITH_SOABI
+set(CYVCF2_PYTHON_ABI_OPTIONS "")
+if(SKBUILD_SABI_VERSION)
+  list(APPEND CYVCF2_PYTHON_ABI_OPTIONS USE_SABI "${SKBUILD_SABI_VERSION}")
+endif()
+
+Python_add_library(cyvcf2_extension MODULE WITH_SOABI ${CYVCF2_PYTHON_ABI_OPTIONS}
   "${CYVCF2_EXTENSION_SOURCE}"
   "${CMAKE_CURRENT_SOURCE_DIR}/cyvcf2/helpers.c"
 )
