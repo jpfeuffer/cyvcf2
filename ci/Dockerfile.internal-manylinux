@@ -1,5 +1,9 @@
 FROM quay.io/pypa/manylinux_2_28_x86_64@sha256:9555ba6c479fa69a2aa80ad1dc57154a60d562b19df159361d9379a02beb1e36
 
-RUN dnf install -y bzip2-devel xz-devel libcurl-devel openssl-devel epel-release \
-    && dnf install -y libdeflate-devel \
+RUN --mount=type=secret,id=trusted_ca \
+    if test -f /run/secrets/trusted_ca; then export SSL_CERT_FILE=/run/secrets/trusted_ca; fi; \
+    dnf --setopt=sslcacert="${SSL_CERT_FILE:-/etc/pki/tls/certs/ca-bundle.crt}" \
+        install -y bzip2-devel xz-devel libcurl-devel openssl-devel epel-release \
+    && dnf --setopt=sslcacert="${SSL_CERT_FILE:-/etc/pki/tls/certs/ca-bundle.crt}" \
+        install -y libdeflate-devel \
     && dnf clean all

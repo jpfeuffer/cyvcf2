@@ -55,6 +55,10 @@ Docker host alone does not establish that the wheel targets x86_64.
 dependencies. Mount only the final sdist, ``ci/`` scripts, and an output folder
 into the local container, then run ``ci/build-internal-linux``. No repository
 source is uploaded to a remote builder.
+If corporate HTTPS requires existing local public CA certificates, pass their
+bundle as the optional BuildKit secret ``trusted_ca``. Mount that same public
+bundle and set ``SSL_CERT_FILE`` for container package downloads. Never disable
+TLS verification or place private keys or credentials into the build context.
 
 Inspect wheel dependencies with ``delocate-listdeps`` or ``auditwheel show``.
 Run ``abi3audit --strict`` on both repaired wheels.
