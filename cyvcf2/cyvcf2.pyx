@@ -27,6 +27,7 @@ import locale
 ENC = locale.getpreferredencoding()
 
 from cython cimport view
+from cpython.ref cimport Py_INCREF
 
 from cpython.version cimport PY_MAJOR_VERSION
 
@@ -267,6 +268,58 @@ cdef class HTSFile:
     def close(self):
         self._c_close()
 
+cdef class _BatchBuffer:
+    cdef void *data
+    cdef Py_ssize_t size
+
+    def __dealloc__(self):
+        stdlib.free(self.data)
+
+    cdef append(self, const void *source, Py_ssize_t count):
+        cdef void *replacement
+        if count == 0:
+            return
+        replacement = stdlib.realloc(self.data, self.size + count)
+        if replacement == NULL:
+            raise MemoryError()
+        self.data = replacement
+        memcpy(<char *>self.data + self.size, source, count)
+        self.size += count
+
+    cdef object as_array(self, int dtype, int itemsize):
+        cdef np.npy_intp shape[1]
+        cdef np.ndarray result
+        shape[0] = self.size // itemsize
+        if self.size == 0:
+            result = np.PyArray_SimpleNew(1, shape, dtype)
+        else:
+            result = np.PyArray_SimpleNewFromData(1, shape, dtype, self.data)
+            Py_INCREF(self)
+            np.PyArray_SetBaseObject(result, self)
+        result.setflags(write=False)
+        return result
+
+
+cdef class _BatchField:
+    cdef bytes tag
+    cdef bint is_format
+    cdef int kind
+    cdef void *scratch
+    cdef int capacity
+    cdef int count
+    cdef _BatchBuffer values, offsets, widths
+
+    def __cinit__(self):
+        self.values = _BatchBuffer()
+        self.offsets = _BatchBuffer()
+        self.widths = _BatchBuffer()
+        cdef int64_t zero = 0
+        self.offsets.append(&zero, 8)
+
+    def __dealloc__(self):
+        stdlib.free(self.scratch)
+
+
 cdef class VCF(HTSFile):
     """
     VCF class holds methods to iterate over and query a VCF.
@@ -304,6 +357,7 @@ cdef class VCF(HTSFile):
     cdef list _seqlens
     # holds a lookup of format field -> type.
     cdef dict format_types
+    cdef bcf1_t *_batch_pending
 
     #: The constant used to indicate the the genotype is HOM_REF.
     cdef readonly int HOM_REF
@@ -339,6 +393,12 @@ cdef class VCF(HTSFile):
 
     def __exit__(self, type, value, tb):
         self.close()
+
+    def close(self):
+        if self._batch_pending != NULL:
+            bcf_destroy(self._batch_pending)
+            self._batch_pending = NULL
+        self._c_close()
 
     def set_threads(self, int n):
         v = hts_set_threads(self.hts, n)
@@ -410,6 +470,8 @@ cdef class VCF(HTSFile):
             list of samples to extract.
         """
         cdef bint is_null = 0
+        if self._batch_pending != NULL:
+            raise ValueError("cannot change samples with a pending batch record")
         if samples is None:
             samples = "-".encode()
         if isinstance(samples, list):
@@ -523,6 +585,8 @@ cdef class VCF(HTSFile):
         cdef bytes bregion
         cdef char *cregion
 
+        if self._batch_pending != NULL:
+            raise ValueError("consume pending batch record before a region query")
         if not region:
             self._open_index()
             if self.hidx == NULL and self.idx == NULL:
@@ -713,6 +777,8 @@ cdef class VCF(HTSFile):
     contains = __contains__
 
     def __dealloc__(self):
+        if self._batch_pending != NULL:
+            bcf_destroy(self._batch_pending)
         if self.hdr != NULL:
             bcf_hdr_destroy(self.hdr)
             self.hdr = NULL
@@ -733,6 +799,10 @@ cdef class VCF(HTSFile):
         cdef int ret
         if self.hts == NULL:
             raise Exception("attempt to iterate over closed/invalid VCF")
+        if self._batch_pending != NULL:
+            b = self._batch_pending
+            self._batch_pending = NULL
+            return newVariant(b, self)
         with nogil:
             b = bcf_init()
             ret = bcf_read(self.hts, self.hdr, b)
@@ -745,6 +815,144 @@ cdef class VCF(HTSFile):
         else:
             raise Exception("error parsing variant with `htslib::bcf_read` error-code: %d and ret: %d" % (
                 b.errcode, ret))
+
+    def read_batch(self, fields=("FORMAT/GT",), *, Py_ssize_t max_rows=1024,
+                   Py_ssize_t max_bytes=64 * 1024 * 1024):
+        """Experimental sequential native columns; see docs/native-batches.md."""
+        cdef list specs = []
+        cdef _BatchField field
+        cdef _BatchBuffer buf, positions = _BatchBuffer(), rids = _BatchBuffer()
+        cdef _BatchBuffer lengths = _BatchBuffer(), quals = _BatchBuffer()
+        cdef _BatchBuffer strings = _BatchBuffer(), string_offsets = _BatchBuffer()
+        cdef bcf1_t *record = NULL
+        cdef int ret, err, width, i
+        cdef bint ready = False
+        cdef int64_t offset = 0, pos
+        cdef Py_ssize_t rows = 0, used, needed, string_size
+        cdef bytes text
+        if self.hts == NULL:
+            raise ValueError("read_batch on closed/invalid VCF")
+        if max_rows <= 0 or max_bytes <= 0:
+            raise ValueError("max_rows and max_bytes must be positive")
+        if isinstance(fields, str):
+            raise TypeError("fields must be a sequence, not a string")
+        fields = tuple(fields)
+        if len(set(fields)) != len(fields):
+            raise ValueError("duplicate requested fields")
+        used = 8 * (len(fields) + 1)
+        if used > max_bytes:
+            raise ValueError("max_bytes cannot hold empty column offsets")
+        for name in fields:
+            if not isinstance(name, str) or name.count("/") != 1:
+                raise ValueError("fields require FORMAT/name or INFO/name")
+            scope, tag = name.split("/")
+            if scope not in ("FORMAT", "INFO") or not tag:
+                raise ValueError("fields require FORMAT/name or INFO/name")
+            header = self.get_header_type(tag, order=[
+                BCF_HL_FMT if scope == "FORMAT" else BCF_HL_INFO])
+            if not (scope == "FORMAT" and tag == "GT") and header["Type"] not in ("Integer", "Float"):
+                raise ValueError("read_batch supports numeric fields and FORMAT/GT only")
+            field = _BatchField()
+            field.tag = to_bytes(tag)
+            field.is_format = scope == "FORMAT"
+            field.kind = BCF_HT_REAL if header["Type"] == "Float" else BCF_HT_INT
+            specs.append(field)
+        string_offsets.append(&offset, 8)
+        try:
+            if self._batch_pending != NULL:
+                record = self._batch_pending
+                self._batch_pending = NULL
+                ready = True
+            else:
+                record = bcf_init()
+                if record == NULL:
+                    raise MemoryError()
+            while rows < max_rows:
+                if not ready:
+                    with nogil:
+                        ret = bcf_read(self.hts, self.hdr, record)
+                    if ret < 0 and record.errcode != BCF_ERR_CTG_UNDEF:
+                        err = record.errcode
+                        bcf_destroy(record)
+                        record = NULL
+                        if ret == -1:
+                            break
+                        raise ValueError("bcf_read failed: ret=%d errcode=%d" % (ret, err))
+                ready = False
+                if bcf_unpack(record, 1 | 2) != 0:
+                    raise ValueError("bcf_unpack failed")
+                # Packed basic strings: CHROM, ID, REF, ALT..., FILTERS; tab-delimited.
+                text = bcf_hdr_id2name(self.hdr, record.rid)
+                text += b"\t" + <bytes>record.d.id
+                for i in range(record.n_allele):
+                    text += b"\t" + <bytes>record.d.allele[i]
+                text += b"\t"
+                for i in range(record.d.n_flt):
+                    if i:
+                        text += b";"
+                    text += <bytes>bcf_hdr_int2id(self.hdr, BCF_DT_ID, record.d.flt[i])
+                string_size = len(text)
+                needed = 32 + string_size
+                for field in specs:
+                    if field.is_format and self.n_samples == 0:
+                        field.count = -3
+                    elif field.is_format:
+                        field.count = bcf_get_format_values(
+                            self.hdr, record, field.tag, &field.scratch,
+                            &field.capacity, field.kind)
+                    else:
+                        field.count = bcf_get_info_values(
+                            self.hdr, record, field.tag, &field.scratch,
+                            &field.capacity, field.kind)
+                    if field.count < 0 and field.count != -3:
+                        raise ValueError("cannot decode %s: HTSlib status %d" %
+                                         (field.tag, field.count))
+                    needed += 12 + <Py_ssize_t>max(0, field.count) * 4
+                if needed > max_bytes - used:
+                    self._batch_pending = record
+                    record = NULL
+                    if rows == 0:
+                        raise ValueError("single record exceeds max_bytes; retry with a larger cap or next(reader)")
+                    break
+                pos = record.pos + 1
+                positions.append(&pos, 8)
+                rids.append(&record.rid, 4)
+                lengths.append(&record.rlen, 8)
+                quals.append(&record.qual, 4)
+                strings.append(<const char *>text, string_size)
+                offset = strings.size
+                string_offsets.append(&offset, 8)
+                for field in specs:
+                    if field.count >= 0:
+                        field.values.append(field.scratch, <Py_ssize_t>field.count * 4)
+                        width = (field.count // self.n_samples if self.n_samples else 0) if field.is_format else field.count
+                    else:
+                        width = -1
+                    offset = field.values.size // 4
+                    field.offsets.append(&offset, 8)
+                    field.widths.append(&width, 4)
+                rows += 1
+                used += needed
+        finally:
+            if record != NULL:
+                bcf_destroy(record)
+        columns = {}
+        for name, field in zip(fields, specs):
+            columns[name] = {
+                "values": field.values.as_array(np.NPY_FLOAT32 if field.kind == BCF_HT_REAL else np.NPY_INT32, 4),
+                "offsets": field.offsets.as_array(np.NPY_INT64, 8),
+                "widths": field.widths.as_array(np.NPY_INT32, 4),
+            }
+        return {
+            "num_rows": rows, "num_samples": self.n_samples, "nbytes": used,
+            "POS": positions.as_array(np.NPY_INT64, 8),
+            "rid": rids.as_array(np.NPY_INT32, 4),
+            "rlen": lengths.as_array(np.NPY_INT64, 8),
+            "QUAL": quals.as_array(np.NPY_FLOAT32, 4),
+            "strings": strings.as_array(np.NPY_UINT8, 1),
+            "string_offsets": string_offsets.as_array(np.NPY_INT64, 8),
+            "fields": columns,
+        }
 
 
     property samples:

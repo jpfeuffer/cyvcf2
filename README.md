@@ -22,6 +22,10 @@ Attributes like `variant.gt_ref_depths` work for diploid samples and return a nu
 **note** that the array is backed by the underlying C data, so, once `variant` goes out of scope. The array will contain nonsense.
 To persist a copy, use: `cpy = np.array(variant.gt_ref_depths)` instead of just `arr = variant.gt_ref_depths`.
 
+This fork also provides an opt-in experimental
+[`VCF.read_batch` columnar reader](docs/native-batches.md) with owned arrays,
+requested numeric fields, and explicit row/output-byte limits.
+
 Example
 =======
 

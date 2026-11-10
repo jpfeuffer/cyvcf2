@@ -288,6 +288,7 @@ cdef extern from "htslib/vcf.h":
     int bcf_get_format_string(const bcf_hdr_t *hdr, bcf1_t *line, const char *tag, char ***dst, int *ndst);
 
     int bcf_get_format_values(const bcf_hdr_t *hdr, bcf1_t *line, const char *tag, void **dst, int *ndst, int type);
+    int bcf_get_info_values(const bcf_hdr_t *hdr, bcf1_t *line, const char *tag, void **dst, int *ndst, int type);
     int bcf_gt_is_phased(int);
     int bcf_gt_is_missing(int);
     int bcf_gt_allele(int);
