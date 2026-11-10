@@ -941,6 +941,26 @@ def test_mixed_ploidy_phase_accessors(tmp_path, calls, expected):
         np.testing.assert_array_equal(variant.gt_phases, phases)
 
 
+def test_padded_haploid_missing_genotype_is_not_phased(tmp_path):
+    path = tmp_path / "padded-haploid.vcf"
+    path.write_text(
+        '##fileformat=VCFv4.3\n'
+        '##contig=<ID=1>\n'
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        '##FORMAT=<ID=DI,Number=.,Type=Integer,Description="Integer list">\n'
+        '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n'
+        '1\t1\t.\tA\tC\t.\tPASS\t.\tGT:DI\t./.:.,.\t.:.\n'
+    )
+    with VCF(path) as vcf:
+        variant = next(vcf)
+        assert variant.genotypes == [[-1, -1, False], [-1, False]]
+        assert [variant.genotype.phased(i) for i in range(2)] == [False, False]
+        np.testing.assert_array_equal(
+            variant.genotype.array(), [[-1, -1, 0], [-1, -2, 0]]
+        )
+        np.testing.assert_array_equal(variant.gt_phases, [False, False])
+
+
 def test_access_gts():
     vcf = VCF('{}/test-format-string.vcf'.format(HERE))
     """
@@ -961,7 +981,7 @@ def test_access_gts():
     assert v.genotypes == [[0, 1, -1, False], [0, True]], v.genotypes
 
     v = next(vcf)
-    assert v.genotypes == [[-1, True], [0, 2, True]], v.genotypes
+    assert v.genotypes == [[-1, False], [0, 2, True]], v.genotypes
 
 def test_access_genotype():
     vcf = VCF('{}/test-format-string.vcf'.format(HERE))
@@ -1051,13 +1071,13 @@ def test_access_genotype_array():
     v = next(vcf)
     np.testing.assert_array_equal(
         v.genotype.array(),
-        np.array([[-1, -2, 1], [0, 2, 1]], dtype=np.int16)
+        np.array([[-1, -2, 0], [0, 2, 1]], dtype=np.int16)
     )
 
     # test fill value
     np.testing.assert_array_equal(
         v.genotype.array(fill=-9),
-        np.array([[-1, -9, 1], [0, 2, 1]], dtype=np.int16)
+        np.array([[-1, -9, 0], [0, 2, 1]], dtype=np.int16)
     )
 
 def test_alt_homozygous_gt():

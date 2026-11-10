@@ -1221,7 +1221,10 @@ cdef class Genotypes(object):
         """
         a boolean indicating that the ith sample is phased.
         """
-        return (self._raw[i * self.ploidy + (1 if self.ploidy > 1 else 0)] & 1) == 1
+        cdef int offset = i * self.ploidy
+        if self.ploidy > 1 and self._raw[offset + 1] != bcf_int32_vector_end:
+            offset += 1
+        return (self._raw[offset] & 1) == 1
 
     def alleles(self, int i):
         cdef list result = []
@@ -1583,7 +1586,7 @@ cdef class Variant(object):
             if self._genotypes is not None:
               return self._genotypes
             cdef int32_t *gts = NULL
-            cdef int i, j, nret, off = 0, ndst = 0, k = 0
+            cdef int i, j, nret, off = 0, ndst = 0, k = 0, phase_idx
             cdef int n_samples = self.vcf.n_samples
             #self._genotypes = []
             nret = bcf_get_genotypes(self.vcf.hdr, self.b, &gts, &ndst)
@@ -1602,8 +1605,11 @@ cdef class Variant(object):
                   if gts[k + j] == bcf_int32_vector_end:
                       break
                   self._genotypes[i].append(bcf_gt_allele(gts[k + j]))
+              phase_idx = k
+              if nret > 1 and gts[k + 1] != bcf_int32_vector_end:
+                  phase_idx += 1
               self._genotypes[i].append(
-                    bool(bcf_gt_is_phased(gts[k + (1 if nret > 1 else 0)])))
+                    bool(bcf_gt_is_phased(gts[phase_idx])))
 
             stdlib.free(gts)
             return self._genotypes
@@ -1691,7 +1697,7 @@ cdef class Variant(object):
         HOM_REF=0, HET=1. For `gts012=True` HOM_ALT=2, UNKNOWN=3
         """
         def __get__(self):
-            cdef int ndst = 0, ngts, n, i, nper, j = 0, k = 0
+            cdef int ndst = 0, ngts, n, i, nper, j = 0, k = 0, phase_idx
             cdef int a
             if self.vcf.n_samples == 0:
                 return np.array([])
@@ -1713,8 +1719,11 @@ cdef class Variant(object):
                         else:
                             self._gt_idxs[k] = a
 
+                    phase_idx = i
+                    if nper > 1 and self._gt_types[i + 1] != bcf_int32_vector_end:
+                        phase_idx += 1
                     self._gt_phased[j] = self._gt_types[i] > 0 and <int>bcf_gt_is_phased(
-                        self._gt_types[i + (1 if nper > 1 else 0)])
+                        self._gt_types[phase_idx])
                     j += 1
 
                 if self.vcf.gts012:
