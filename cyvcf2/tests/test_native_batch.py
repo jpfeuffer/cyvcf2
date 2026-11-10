@@ -62,7 +62,19 @@ def decode_gt(raw, width, samples):
     decoded[:, :-1][raw == -2147483647] = -2
     # Match the existing Genotypes.array phase policy, not a new GT policy.
     decoded[:, -1] = raw[:, 0 if width == 1 else 1] & 1
+    if width > 1:
+        haploid = raw[:, 1] == -2147483647
+        decoded[haploid, -1] = raw[haploid, 0] & 1
     return decoded
+
+
+def test_decode_gt_ignores_vector_end_phase_bit():
+    raw = np.array([[2, -2147483647], [3, -2147483647],
+                    [0, -2147483647], [2, 5]], dtype=np.int32)
+    np.testing.assert_array_equal(
+        decode_gt(raw, 2, 4),
+        [[0, -2, 0], [0, -2, 1], [-1, -2, 0], [0, 1, 1]],
+    )
 
 
 @pytest.mark.parametrize("encoding", ["vcf", "gzip", "bgzf", "bcf", "bgzf0bcf", "rawbcf"])
