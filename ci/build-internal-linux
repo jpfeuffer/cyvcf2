@@ -1,0 +1,33 @@
+#!/bin/bash
+set -euo pipefail
+
+if [[ $# != 2 || "$(uname -sm)" != "Linux x86_64" ]]; then
+    echo "Usage inside the pinned manylinux image: bash ci/build-internal-linux SDIST NEW_OUTPUT_DIRECTORY" >&2
+    exit 2
+fi
+ci="$(cd "$(dirname "$0")" && pwd)"
+sdist="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+if [[ -e "$2" ]]; then
+    echo "Output directory must not already exist." >&2
+    exit 1
+fi
+mkdir -p "$2"
+output="$(cd "$2" && pwd)"
+export CYVCF2_HTSLIB_MODE=BUILTIN
+export CYVCF2_CYTHONIZE=ON
+export CYVCF2_HTSLIB_CONFIGURE_OPTIONS="--enable-libcurl --enable-s3 --enable-lzma --enable-bz2 --with-libdeflate"
+export CMAKE_BUILD_PARALLEL_LEVEL=2
+uv build --python /opt/python/cp312-cp312/bin/python \
+    --build-constraints "$ci/internal-build-constraints.txt" \
+    --wheel --out-dir "$output/unrepaired" "$sdist"
+wheels=("$output"/unrepaired/*.whl)
+[[ ${#wheels[@]} == 1 && -f "${wheels[0]}" ]]
+auditwheel repair --plat manylinux_2_28_x86_64 -w "$output/artifacts" "${wheels[0]}"
+wheels=("$output"/artifacts/*.whl)
+[[ ${#wheels[@]} == 1 && -f "${wheels[0]}" ]]
+auditwheel show "${wheels[0]}" > "$output/dynamic-dependencies.txt"
+uv tool run --from abi3audit==0.0.26 abi3audit --strict "${wheels[0]}"
+rpm -qa | sort > "$output/native-packages.txt"
+uv --version > "$output/build-info.txt"
+uname -sm >> "$output/build-info.txt"
+sha256sum "${wheels[0]}" > "$output/SHA256SUMS"

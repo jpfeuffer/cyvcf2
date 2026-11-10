@@ -39,10 +39,22 @@ Keep the build log, dependency versions, and container image digest alongside
 these outputs. Reproducible source provenance does not promise byte-identical
 wheels across different compilers or build dependency versions.
 
+For portable macOS compression libraries, first run
+``bash ci/build-internal-macos-deps dist/macos-deps`` with CMake and Ninja on
+``PATH``. Set ``CPPFLAGS=-I$PWD/dist/macos-deps/prefix/include``,
+``LDFLAGS=-L$PWD/dist/macos-deps/prefix/lib``,
+``PKG_CONFIG_PATH=$PWD/dist/macos-deps/prefix/lib/pkgconfig``, and
+``MACOSX_DEPLOYMENT_TARGET=11.0`` for the release build. Do not mix in newer
+Homebrew compression libraries, which may require a higher OS version.
+
 Build macOS Apple Silicon wheels natively. Build Linux x86_64 wheels locally
 inside a pinned ``manylinux_2_28_x86_64`` container using
 ``--platform linux/amd64``; verify ``uname -m`` reports ``x86_64``. An arm64
 Docker host alone does not establish that the wheel targets x86_64.
+``ci/Dockerfile.internal-manylinux`` pins the base image and installs native
+dependencies. Mount only the final sdist, ``ci/`` scripts, and an output folder
+into the local container, then run ``ci/build-internal-linux``. No repository
+source is uploaded to a remote builder.
 
 Inspect wheel dependencies with ``delocate-listdeps`` or ``auditwheel show``.
 Run ``abi3audit --strict`` on both repaired wheels.
@@ -52,6 +64,9 @@ version and all four APIs, and run the complete combined source test suite
 against that installed wheel. Inspect the sdist for all Cython/helper sources,
 bundled HTSlib/htscodecs, and the exact-unit manifest; no local environment,
 credentials, or build outputs may be included.
+``ci/validate-internal-wheel`` creates an isolated environment, imports the
+installed ABI3 extension outside the checkout, and runs all supplied source
+tests as a package without shadowing the installed extension.
 
 Publish and verify
 ------------------

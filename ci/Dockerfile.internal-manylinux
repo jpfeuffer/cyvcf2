@@ -1,0 +1,5 @@
+FROM quay.io/pypa/manylinux_2_28_x86_64@sha256:9555ba6c479fa69a2aa80ad1dc57154a60d562b19df159361d9379a02beb1e36
+
+RUN dnf install -y bzip2-devel xz-devel libcurl-devel openssl-devel epel-release \
+    && dnf install -y libdeflate-devel \
+    && dnf clean all

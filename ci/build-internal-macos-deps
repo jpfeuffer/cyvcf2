@@ -1,0 +1,42 @@
+#!/bin/bash
+set -euo pipefail
+
+if [[ $# != 1 || "$(uname -sm)" != "Darwin arm64" ]]; then
+    echo "Usage on macOS arm64: bash ci/build-internal-macos-deps NEW_OUTPUT_DIRECTORY" >&2
+    exit 2
+fi
+if [[ -e "$1" ]]; then
+    echo "Output directory must not already exist." >&2
+    exit 1
+fi
+mkdir -p "$1"
+cd "$1"
+root="$PWD"
+prefix="$root/prefix"
+curl -fsSL https://github.com/tukaani-project/xz/releases/download/v5.8.4/xz-5.8.4.tar.gz -o xz-5.8.4.tar.gz
+curl -fsSL https://github.com/ebiggers/libdeflate/archive/refs/tags/v1.25.tar.gz -o libdeflate-1.25.tar.gz
+printf '%s\n' \
+    "0014c7886930454fe8bd4228665b51af55eeae560ea135c9c4cd33f55b2591d9  xz-5.8.4.tar.gz" \
+    "d11473c1ad4c57d874695e8026865e38b47116bbcb872bfc622ec8f37a86017d  libdeflate-1.25.tar.gz" > SHA256SUMS
+shasum -a 256 -c SHA256SUMS
+tar -xzf xz-5.8.4.tar.gz
+tar -xzf libdeflate-1.25.tar.gz
+common=(
+    -G Ninja
+    -DCMAKE_BUILD_TYPE=Release
+    "-DCMAKE_INSTALL_PREFIX=$prefix"
+    -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+    -DCMAKE_OSX_ARCHITECTURES=arm64
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+)
+cmake -S xz-5.8.4 -B xz-build "${common[@]}" \
+    -DBUILD_SHARED_LIBS=OFF -DXZ_TOOL_XZ=OFF -DXZ_TOOL_XZDEC=OFF \
+    -DXZ_TOOL_LZMADEC=OFF -DXZ_TOOL_LZMAINFO=OFF -DXZ_TOOL_SCRIPTS=OFF \
+    -DXZ_DOC=OFF -DXZ_NLS=OFF
+cmake --build xz-build --parallel 2
+cmake --install xz-build
+cmake -S libdeflate-1.25 -B libdeflate-build "${common[@]}" \
+    -DLIBDEFLATE_BUILD_SHARED_LIB=OFF -DLIBDEFLATE_BUILD_GZIP=OFF
+cmake --build libdeflate-build --parallel 2
+cmake --install libdeflate-build
+printf 'Static dependencies installed into %s\n' "$prefix"

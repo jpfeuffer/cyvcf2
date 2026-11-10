@@ -1,0 +1,30 @@
+#!/bin/bash
+set -euo pipefail
+
+if [[ $# != 4 ]]; then
+    echo "Usage: bash ci/validate-internal-wheel PYTHON WHEEL TEST_DIRECTORY NEW_OUTPUT_DIRECTORY" >&2
+    exit 2
+fi
+python="$1"
+wheel="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
+tests="$(cd "$3" && pwd)"
+if [[ -e "$4" ]]; then
+    echo "Validation output directory must not already exist." >&2
+    exit 1
+fi
+mkdir -p "$4"
+output="$(cd "$4" && pwd)"
+uv venv --python "$python" "$output/venv"
+python="$output/venv/bin/python"
+dependencies=(pytest==9.2.0)
+if [[ "$("$python" -c 'import sys; print(sys.version_info[:2] == (3, 12))')" == "True" ]]; then
+    dependencies+=(numpy==2.0.0)
+fi
+uv pip install --python "$python" --only-binary=:all: "${dependencies[@]}" "$wheel"
+site="$("$python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+cp -R "$tests" "$site/cyvcf2/tests"
+mkdir "$output/run"
+cd "$output/run"
+"$python" -c 'import sys, numpy, cyvcf2; import cyvcf2.cyvcf2 as extension; from cyvcf2 import VCF, Variant; assert cyvcf2.__version__ == "0.35.0+pfizer.1"; assert extension.__file__.endswith(".abi3.so"); assert hasattr(VCF, "schema_scan") and hasattr(VCF, "read_batch") and hasattr(Variant, "format_values"); print(sys.version); print("NumPy", numpy.__version__); print(extension.__file__)' > "$output/smoke.txt"
+uv pip freeze --python "$python" > "$output/dependencies.txt"
+"$python" -m pytest -q "$site/cyvcf2/tests" | tee "$output/pytest.txt"
