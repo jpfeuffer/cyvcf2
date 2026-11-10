@@ -26,6 +26,10 @@ The opt-in [`variant.format_values("VS")`](docs/format-values.md) returns
 comma-separated String/Character FORMAT values as per-sample lists without
 changing `variant.format("VS")`.
 
+This fork also provides an opt-in experimental
+[`VCF.read_batch` columnar reader](docs/native-batches.md) with owned arrays,
+requested numeric fields, and explicit row/output-byte limits.
+
 Example
 =======
 
