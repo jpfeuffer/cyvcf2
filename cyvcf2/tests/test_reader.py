@@ -4,7 +4,9 @@ import platform
 import tempfile
 import sys
 import os
+import shutil
 import atexit
+import gzip
 try:
   from pathlib import Path
 except ImportError:
@@ -1458,6 +1460,678 @@ def test_num_records_no_index(path):
     vcf = VCF(os.path.join(HERE, path))
     with pytest.raises(ValueError, match="must be indexed"):
         vcf.num_records
+
+@pytest.mark.parametrize("mode", ["vcf", "wz", "wb", "raw_bcf"])
+@pytest.mark.parametrize("values,logical,width", [
+    (("longword", "x,y"), {"min": 1, "max": 2}, 9),
+    (("a,b", "x"), {"min": 1, "max": 2}, 4),
+    (("a%2Cb", "x%252Cy"), {"min": 1, "max": 1}, 8),
+    (("\u00e9,\u03bb", "x"), {"min": 1, "max": 2}, 6),
+    ((".,.", "."), {"min": 1, "max": 2}, 4),
+])
+def test_schema_scan_logical_string_cardinality(tmp_path, mode, values, logical, width):
+    path = tmp_path / "input.vcf"
+    path.write_text(
+        '##fileformat=VCFv4.3\n'
+        '##contig=<ID=1>\n'
+        '##INFO=<ID=IS,Number=.,Type=String,Description="Strings">\n'
+        '##INFO=<ID=IC,Number=2,Type=Character,Description="Characters">\n'
+        '##INFO=<ID=US,Number=.,Type=String,Description="Unused">\n'
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="GT">\n'
+        '##FORMAT=<ID=VS,Number=.,Type=String,Description="Strings">\n'
+        '##FORMAT=<ID=VC,Number=.,Type=Character,Description="Characters">\n'
+        '##FORMAT=<ID=UV,Number=.,Type=String,Description="Unused">\n'
+        '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n'
+        '1\t1\t.\tA\tC\t.\tPASS\tIS=%s;IC=a,b\tGT:VS:VC\t0/1:%s:a,b\t0/0:%s:c\n'
+        % (values[0], values[0], values[1]),
+        encoding="utf-8",
+    )
+    if mode != "vcf":
+        source = VCF(str(path))
+        output = str(tmp_path / ("input.bcf" if mode in ("wb", "raw_bcf") else "input.vcf.gz"))
+        writer = Writer(output, source, mode="wb" if mode == "raw_bcf" else mode)
+        for variant in source:
+            writer.write_record(variant)
+        writer.close()
+        source.close()
+        path = output
+        if mode == "raw_bcf":
+            raw = tmp_path / "raw.bcf"
+            with gzip.open(path, "rb") as stream:
+                raw.write_bytes(stream.read())
+            path = raw
+
+    summary = VCF(str(path)).schema_scan(threads=1)
+    fields = summary["fields"]
+    assert fields["FORMAT"]["VS"]["logical_cardinality"] == logical
+    assert fields["FORMAT"]["VS"]["cardinality"] == {"min": width, "max": width}
+    info_count = values[0].count(",") + 1
+    assert fields["INFO"]["IS"]["logical_cardinality"] == {"min": info_count, "max": info_count}
+    assert fields["INFO"]["IC"]["logical_cardinality"] == {"min": 2, "max": 2}
+    assert fields["FORMAT"]["VC"]["logical_cardinality"] == {"min": 1, "max": 2}
+    for section, name in (("INFO", "US"), ("FORMAT", "UV")):
+        assert fields[section][name]["logical_cardinality"] == {"min": None, "max": None}
+    assert "logical_cardinality" not in fields["FORMAT"]["GT"]
+    assert summary["ploidy"] == {2: 2}
+
+
+@pytest.mark.parametrize("mode", ["wz", "wb", "vcf", "raw_bcf"])
+def test_schema_scan_logical_string_cardinality_parallel(tmp_path, mode):
+    path = tmp_path / "input.vcf"
+    path.write_text(
+        '##fileformat=VCFv4.3\n'
+        '##contig=<ID=1>\n'
+        '##INFO=<ID=PAD,Number=1,Type=String,Description="Long scalar">\n'
+        '##FORMAT=<ID=VS,Number=.,Type=String,Description="Strings">\n'
+        '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\n'
+        + "".join(
+            "1\t%d\t.\tA\tC\t.\tPASS\tPAD=%s\tVS\t%s\t%s\n"
+            % (i + 1, "a" * 4000, "longword" if i < 50 else "a,b,c", "x,y")
+            for i in range(100)
+        )
+    )
+    if mode != "vcf":
+        source = VCF(str(path))
+        output = str(tmp_path / ("input.vcf.gz" if mode == "wz" else "input.bcf"))
+        writer = Writer(output, source, mode="wb" if mode == "raw_bcf" else mode)
+        for variant in source:
+            writer.write_record(variant)
+        writer.close()
+        source.close()
+        path = output
+        if mode == "raw_bcf":
+            raw = tmp_path / "raw.bcf"
+            with gzip.open(path, "rb") as stream:
+                raw.write_bytes(stream.read())
+            path = raw
+    serial = VCF(str(path)).schema_scan(threads=1)
+    parallel = VCF(str(path)).schema_scan(threads=1, workers=3)
+    assert parallel == serial
+    assert parallel["fields"]["FORMAT"]["VS"]["logical_cardinality"] == {"min": 1, "max": 3}
+    assert parallel["fields"]["INFO"]["PAD"]["logical_cardinality"] == {"min": 1, "max": 1}
+
+
+def test_schema_scan_summary():
+    path = os.path.join(HERE, "test.snpeff.vcf")
+    vcf = VCF(path)
+    expected_records = sum(1 for _ in VCF(path))
+    expected_next_pos = list(VCF(path))[2].POS
+    next(vcf)
+    next(vcf)
+    summary = vcf.schema_scan(threads=1)
+
+    assert summary["records"] == expected_records
+    assert summary["samples"] == len(vcf.samples)
+    assert summary["index"] == {"available": False, "built": False, "path": None}
+    assert sum(summary["alleles_per_record"].values()) == expected_records
+    assert sum(summary["ploidy"].values()) > 0
+    assert summary["fields"]["INFO"]["DP"]["numeric_bounds"] is not None
+    assert summary["fields"]["FORMAT"]["GT"]["cardinality"]["max"] >= 1
+    assert summary["fields"]["FORMAT"]["GT"]["total_values"] >= expected_records * len(vcf.samples)
+    assert next(vcf).POS == expected_next_pos
+
+def test_schema_scan_builds_csi_and_tbi_indexes(tmp_path):
+    path = os.path.join(HERE, "multi-contig.vcf.gz")
+    expected_records = sum(1 for _ in VCF(path))
+    first_record = next(VCF(path))
+
+    for suffix in ("csi", "tbi"):
+        index_path = str(tmp_path / ("scan." + suffix))
+        summary = VCF(path).schema_scan(index_path=index_path, threads=2)
+        assert summary["records"] == expected_records
+        assert summary["index"] == {
+            "available": True,
+            "built": True,
+            "path": index_path,
+        }
+
+        indexed_vcf = VCF(path)
+        indexed_vcf.set_index(index_path)
+        assert indexed_vcf.num_records == expected_records
+        region = "%s:%d-%d" % (
+            first_record.CHROM, first_record.POS, first_record.POS)
+        assert list(indexed_vcf(region))
+        reused = VCF(path).schema_scan(index_path=index_path)
+        assert reused["index"] == {
+            "available": True,
+            "built": False,
+            "path": index_path,
+        }
+
+def test_schema_scan_csi_index_is_discovered_for_region_queries(tmp_path):
+    source_path = os.path.join(HERE, "multi-contig.vcf.gz")
+    path = str(tmp_path / "input.vcf.gz")
+    shutil.copyfile(source_path, path)
+    first_record = next(VCF(path))
+    VCF(path).schema_scan(index_path=path + ".csi")
+
+    region = "%s:%d-%d" % (
+        first_record.CHROM, first_record.POS, first_record.POS)
+    assert list(VCF(path)(region))
+
+@pytest.mark.parametrize("suffix", ["csi", "tbi"])
+def test_schema_scan_indexes_only_contigs_with_records(tmp_path, suffix):
+    source = VCF(os.path.join(HERE, "multi-contig.vcf.gz"))
+    record = next(record for record in source if record.CHROM == "20")
+    path = str(tmp_path / "single-contig.vcf.gz")
+    writer = Writer(path, source)
+    writer.write_record(record)
+    writer.close()
+
+    index_path = path + "." + suffix
+    summary = VCF(path).schema_scan(index_path=index_path)
+    assert summary["records"] == 1
+    region = "%s:%d-%d" % (record.CHROM, record.POS, record.POS)
+    assert len(list(VCF(path)(region))) == 1
+
+def test_schema_scan_reuses_existing_index():
+    path = VCF_PATH
+    index_path = path + ".tbi"
+    summary = VCF(path).schema_scan(index_path=index_path)
+
+    assert summary["index"] == {
+        "available": True,
+        "built": False,
+        "path": index_path,
+    }
+
+def test_schema_scan_rejects_unsorted_index_input(tmp_path):
+    source = VCF(os.path.join(HERE, "test.snpeff.vcf"))
+    records = list(source)
+    output_path = str(tmp_path / "unsorted.vcf.gz")
+    writer = Writer(output_path, source)
+    for record in reversed(records):
+        writer.write_record(record)
+    writer.close()
+
+    index_path = str(tmp_path / "unsorted.csi")
+    with pytest.raises(ValueError, match="coordinate-sorted"):
+        VCF(output_path).schema_scan(index_path=index_path)
+    assert not os.path.exists(index_path)
+
+@pytest.mark.parametrize("suffix", ["csi", "tbi"])
+def test_schema_scan_parallel_workers_builds_index(tmp_path, suffix):
+    path = VCF_PATH
+    expected = VCF(path).schema_scan()
+    index_path = str(tmp_path / ("parallel." + suffix))
+
+    parallel = VCF(path).schema_scan(index_path=index_path, workers=2)
+
+    assert parallel["records"] == expected["records"]
+    assert parallel["samples"] == expected["samples"]
+    assert parallel["alleles_per_record"] == expected["alleles_per_record"]
+    assert parallel["allele_counts"] == expected["allele_counts"]
+    assert parallel["ploidy"] == expected["ploidy"]
+    assert parallel["fields"] == expected["fields"]
+    assert parallel["index"] == {
+        "available": True,
+        "built": True,
+        "path": index_path,
+    }
+    indexed_vcf = VCF(path)
+    indexed_vcf.set_index(index_path)
+    assert indexed_vcf.num_records == expected["records"]
+    reused = VCF(path).schema_scan(index_path=index_path, workers=2)
+    assert reused["index"] == {
+        "available": True,
+        "built": False,
+        "path": index_path,
+    }
+
+@pytest.mark.parametrize("cpu_budget,explicit_workers,expected_workers", [
+    (1, None, 1),
+    (2, None, 1),
+    (3, None, 1),
+    (8, None, 4),
+    (12, None, 6),
+    (12, 2, 2),
+    (12, 1, 1),
+])
+def test_schema_scan_auto_concurrency(
+        tmp_path, monkeypatch, cpu_budget, explicit_workers, expected_workers):
+    import concurrent.futures
+    import shutil
+    import cyvcf2.cyvcf2 as cyvcf2_module
+    from cyvcf2 import _schema_scan as resources
+
+    path = str(tmp_path / "unindexed.vcf.gz")
+    shutil.copyfile(VCF_PATH, path)
+    monkeypatch.setattr(resources, "_available_cpu_count", lambda: cpu_budget)
+    original_ranges = cyvcf2_module._schema_bgzf_ranges
+    original_worker = cyvcf2_module._schema_scan_worker
+    selected_workers = []
+    selected_threads = []
+
+    def recording_ranges(path, workers):
+        selected_workers.append(workers)
+        return original_ranges(path, workers)
+
+    def recording_worker(args):
+        selected_threads.append(args[4])
+        return original_worker(args)
+
+    class InProcessPool(concurrent.futures.ThreadPoolExecutor):
+        def __init__(self, max_workers=None, mp_context=None):
+            super().__init__(max_workers)
+
+    monkeypatch.setattr(cyvcf2_module, "_schema_bgzf_ranges", recording_ranges)
+    monkeypatch.setattr(cyvcf2_module, "_schema_scan_worker", recording_worker)
+    monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", InProcessPool)
+    expected = VCF(path).schema_scan()
+    kwargs = {} if explicit_workers is None else {"workers": explicit_workers}
+    assert VCF(path).schema_scan(threads=0, **kwargs) == expected
+    assert selected_workers == ([expected_workers] if expected_workers > 1 else [])
+    if selected_threads:
+        assert set(selected_threads) == {1}
+
+
+@pytest.mark.parametrize("threads", [-1, 1.5, "0"])
+def test_schema_scan_invalid_threads(threads):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        VCF(VCF_PATH).schema_scan(threads=threads)
+
+def test_schema_scan_auto_process_workers(tmp_path, monkeypatch):
+    from cyvcf2 import _schema_scan as resources
+
+    monkeypatch.setattr(resources, "_available_cpu_count", lambda: 4)
+    bcf_path = _write_multiblock_bcf(tmp_path)
+    for path in (bcf_path, str(tmp_path / "multiblock.vcf")):
+        assert VCF(path).schema_scan(threads=0) == VCF(path).schema_scan()
+
+
+def _write_multiblock_bcf(
+        tmp_path, n_records=4000, n_samples=40, contig_length=None, start_position=1):
+    vcf_path = tmp_path / "multiblock.vcf"
+    samples = ["s%d" % i for i in range(n_samples)]
+    lines = [
+        "##fileformat=VCFv4.2",
+        "##contig=<ID=1%s>" % (
+            ",length=%d" % contig_length if contig_length is not None else ""),
+        "##contig=<ID=2%s>" % (
+            ",length=%d" % contig_length if contig_length is not None else ""),
+        '##FILTER=<ID=LowQ,Description="low quality">',
+        '##INFO=<ID=DP,Number=1,Type=Integer,Description="depth">',
+        '##INFO=<ID=AF,Number=A,Type=Float,Description="frequency">',
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="genotype">',
+        '##FORMAT=<ID=AD,Number=R,Type=Integer,Description="depths">',
+        "\t".join(["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER",
+                   "INFO", "FORMAT"] + samples),
+    ]
+    for i in range(n_records):
+        chrom = "1" if i < n_records // 2 else "2"
+        alts = ",".join(["T", "G", "CA"][:1 + i % 3])
+        n_alts = 1 + i % 3
+        genotypes = [
+            "%d/%d:%s" % (s % (n_alts + 1), (s + i) % (n_alts + 1),
+                          ",".join(str(s + i + k) for k in range(n_alts + 1)))
+            for s in range(n_samples)
+        ]
+        lines.append("\t".join([
+            chrom, str(10 * i + start_position), "rs%d" % i, "A", alts, str(i % 99),
+            "LowQ" if i % 7 == 0 else "PASS",
+            "DP=%d;AF=%s" % (i, ",".join(["0.5"] * n_alts)), "GT:AD",
+        ] + genotypes))
+    vcf_path.write_text("\n".join(lines) + "\n")
+    source = VCF(str(vcf_path))
+    bcf_path = str(tmp_path / "multiblock.bcf")
+    writer = Writer(bcf_path, source, mode="wb")
+    for record in source:
+        writer.write_record(record)
+    writer.close()
+    return bcf_path
+
+@pytest.mark.parametrize("is_bcf", [False, True])
+@pytest.mark.parametrize("contig_length,vcf_depth,bcf_depth", [
+    (None, 8, 6),
+    (100000, 6, 1),
+    ((1 << 29) - 256, 6, 5),
+    ((1 << 29) - 255, 6, 6),
+    (1 << 32, 7, 7),
+])
+def test_schema_scan_csi_depth_matches_htslib(
+        tmp_path, is_bcf, contig_length, vcf_depth, bcf_depth):
+    import ctypes
+    import gzip
+    import struct
+    import cyvcf2.cyvcf2 as cyvcf2_module
+
+    start_position = (1 << 29) + 1 if contig_length == 1 << 32 else 1
+    bcf_path = _write_multiblock_bcf(
+        tmp_path, contig_length=contig_length, start_position=start_position)
+    if is_bcf:
+        path = bcf_path
+    else:
+        path = str(tmp_path / "multiblock.vcf.gz")
+        with VCF(str(tmp_path / "multiblock.vcf")) as source:
+            writer = Writer(path, source, mode="wz")
+            for record in source:
+                writer.write_record(record)
+            writer.close()
+
+    serial_index = str(tmp_path / "serial.csi")
+    parallel_index = str(tmp_path / "parallel.csi")
+    reference_index = str(tmp_path / "reference.csi")
+    serial = VCF(path).schema_scan(index_path=serial_index)
+    parallel = VCF(path).schema_scan(index_path=parallel_index, workers=4, threads=1)
+    serial.pop("index")
+    parallel.pop("index")
+    assert serial == parallel
+
+    native_build = ctypes.CDLL(cyvcf2_module.__file__).bcf_index_build3
+    native_build.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
+                             ctypes.c_int, ctypes.c_int]
+    native_build.restype = ctypes.c_int
+    assert native_build(os.fsencode(path), os.fsencode(reference_index), 14, 0) == 0
+    expected_bytes = (tmp_path / "reference.csi").read_bytes()
+    assert (tmp_path / "serial.csi").read_bytes() == expected_bytes
+    assert (tmp_path / "parallel.csi").read_bytes() == expected_bytes
+    assert struct.unpack("<4sii", gzip.decompress(expected_bytes)[:12]) == (
+        b"CSI\x01", 14, bcf_depth if is_bcf else vcf_depth)
+    with VCF(path) as indexed:
+        indexed.set_index(parallel_index)
+        assert len(list(indexed("2:%d-%d" % (
+            start_position + 29999, start_position + 34999)))) == 500
+
+
+def test_schema_scan_tbi_matches_htslib(tmp_path):
+    import ctypes
+    import cyvcf2.cyvcf2 as cyvcf2_module
+
+    reference_index = str(tmp_path / "reference.tbi")
+    native_build = ctypes.CDLL(cyvcf2_module.__file__).bcf_index_build3
+    native_build.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
+                             ctypes.c_int, ctypes.c_int]
+    native_build.restype = ctypes.c_int
+    assert native_build(os.fsencode(VCF_PATH), os.fsencode(reference_index), 0, 0) == 0
+    expected_bytes = (tmp_path / "reference.tbi").read_bytes()
+    for workers in (1, 4):
+        index_path = tmp_path / ("scan-%d.tbi" % workers)
+        VCF(VCF_PATH).schema_scan(index_path=str(index_path), workers=workers)
+        assert index_path.read_bytes() == expected_bytes
+
+
+def test_schema_scan_parallel_bcf_matches_serial(tmp_path):
+    path = _write_multiblock_bcf(tmp_path)
+    serial_index = str(tmp_path / "serial.csi")
+    serial = VCF(path).schema_scan(index_path=serial_index)
+    serial.pop("index")
+    assert serial["records"] == 4000
+
+    for workers in (2, 5, 16):
+        index_path = str(tmp_path / ("parallel-%d.csi" % workers))
+        parallel = VCF(path).schema_scan(index_path=index_path, workers=workers)
+        assert parallel.pop("index") == {
+            "available": True,
+            "built": True,
+            "path": index_path,
+        }
+        assert parallel == serial
+        with open(index_path, "rb") as a, open(serial_index, "rb") as b:
+            assert a.read() == b.read()
+
+    indexed = VCF(path)
+    indexed.set_index(serial_index)
+    assert len(list(indexed("1:1-100"))) == 10
+    assert len(list(indexed("2:20001-20101"))) == 11
+    reused = VCF(path).schema_scan(index_path=serial_index, workers=4)
+    assert reused["index"]["built"] is False
+
+def test_schema_scan_parallel_bcf_rescans_unverified_starts(tmp_path, monkeypatch):
+    import concurrent.futures
+    import cyvcf2.cyvcf2 as cyvcf2_module
+
+    path = _write_multiblock_bcf(tmp_path)
+    serial = VCF(path).schema_scan()
+    original_worker = cyvcf2_module._schema_scan_worker
+    exact_rescans = []
+
+    def corrupting_worker(args):
+        exact_start = args[7]
+        if exact_start:
+            exact_rescans.append(args[1])
+        summary = original_worker(args)
+        if not exact_start and args[1] >= 0:
+            summary["_actual_start"] = None
+        return summary
+
+    class InProcessPool(concurrent.futures.ThreadPoolExecutor):
+        def __init__(self, max_workers=None, mp_context=None):
+            super().__init__(max_workers)
+
+    monkeypatch.setattr(cyvcf2_module, "_schema_scan_worker", corrupting_worker)
+    monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", InProcessPool)
+    parallel = VCF(path).schema_scan(workers=4)
+
+    assert exact_rescans
+    parallel.pop("index")
+    serial.pop("index")
+    assert parallel == serial
+
+def test_schema_scan_parallel_raw_bcf(tmp_path):
+    import gzip
+
+    bgzf_path = _write_multiblock_bcf(tmp_path)
+    raw_path = str(tmp_path / "raw.bcf")
+    with open(bgzf_path, "rb") as source, open(raw_path, "wb") as target:
+        target.write(gzip.decompress(source.read()))
+    serial = VCF(raw_path).schema_scan()
+    assert serial["records"] == 4000
+
+    for workers in (2, 5, 16):
+        assert VCF(raw_path).schema_scan(workers=workers) == serial
+
+    index_path = str(tmp_path / "raw.csi")
+    with pytest.raises(ValueError, match="BGZF"):
+        VCF(raw_path).schema_scan(index_path=index_path)
+    with pytest.raises(ValueError, match="BGZF"):
+        VCF(raw_path).schema_scan(index_path=index_path, workers=2)
+    assert not os.path.exists(index_path)
+
+def test_schema_scan_parallel_plain_vcf(tmp_path):
+    _write_multiblock_bcf(tmp_path)
+    path = str(tmp_path / "multiblock.vcf")
+    serial = VCF(path).schema_scan()
+    assert serial["records"] == 4000
+
+    for workers in (2, 5, 16, 64):
+        assert VCF(path).schema_scan(workers=workers) == serial
+
+    index_path = str(tmp_path / "plain.csi")
+    with pytest.raises(ValueError, match="BGZF"):
+        VCF(path).schema_scan(index_path=index_path, workers=2)
+    assert not os.path.exists(index_path)
+
+@pytest.mark.parametrize("plain", [False, True])
+def test_schema_scan_parallel_vcf_handoffs(tmp_path, monkeypatch, plain):
+    import concurrent.futures
+    import cyvcf2.cyvcf2 as cyvcf2_module
+
+    if plain:
+        _write_multiblock_bcf(tmp_path)
+        path = str(tmp_path / "multiblock.vcf")
+    else:
+        import shutil
+        path = str(tmp_path / "unindexed.vcf.gz")
+        shutil.copyfile(VCF_PATH, path)
+    serial = VCF(path).schema_scan()
+    original_worker = cyvcf2_module._schema_scan_worker
+    exact_rescans = []
+    corrupt = []
+
+    def recording_worker(args):
+        exact_start = args[7]
+        if exact_start:
+            exact_rescans.append(args[1])
+        summary = original_worker(args)
+        if corrupt and not exact_start and args[1] >= 0:
+            summary["_actual_start"] = None
+        return summary
+
+    class InProcessPool(concurrent.futures.ThreadPoolExecutor):
+        def __init__(self, max_workers=None, mp_context=None):
+            super().__init__(max_workers)
+
+    monkeypatch.setattr(cyvcf2_module, "_schema_scan_worker", recording_worker)
+    monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", InProcessPool)
+    assert VCF(path).schema_scan(workers=4) == serial
+    assert not exact_rescans
+
+    corrupt.append(True)
+    assert VCF(path).schema_scan(workers=4) == serial
+    assert exact_rescans
+
+@pytest.mark.parametrize("suffix", ["tbi", "csi", "bcf.csi"])
+def test_schema_scan_existing_index_splits(tmp_path, monkeypatch, suffix):
+    import cyvcf2.cyvcf2 as native
+    bcf_path = _write_multiblock_bcf(tmp_path)
+    if suffix == "bcf.csi":
+        path = bcf_path
+    else:
+        path = str(tmp_path / "indexed.vcf.gz")
+        with VCF(str(tmp_path / "multiblock.vcf")) as source:
+            writer = Writer(path, source, mode="wz")
+            for record in source:
+                writer.write_record(record)
+            writer.close()
+    index_path = path + (".tbi" if suffix == "tbi" else ".csi")
+    expected = VCF(path).schema_scan(index_path=index_path)
+    original_bytes = Path(index_path).read_bytes()
+    planned = []
+    original = native._schema_index_ranges
+
+    def indexed_ranges(*args):
+        result = original(*args)
+        planned.append(result)
+        return result
+
+    def forbidden(*args):
+        raise AssertionError("existing index should avoid BGZF discovery")
+
+    monkeypatch.setattr(native, "_schema_index_ranges", indexed_ranges)
+    monkeypatch.setattr(native, "_schema_bgzf_ranges", forbidden)
+    for destination in (None, index_path):
+        parallel = VCF(path).schema_scan(index_path=destination, workers=4)
+        parallel.pop("index")
+        assert parallel == {key: value for key, value in expected.items() if key != "index"}
+    assert planned and any(len(ranges) > 1 for ranges, _ in planned)
+    assert Path(index_path).read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_schema_scan_corrupted_index_is_not_overwritten(tmp_path, workers, explicit):
+    import shutil
+    path = str(tmp_path / "input.vcf.gz")
+    shutil.copyfile(VCF_PATH, path)
+    index_path = path + ".csi"
+    Path(index_path).write_bytes(b"not an index")
+    with pytest.raises(OSError, match="existing index"):
+        VCF(path).schema_scan(
+            index_path=index_path if explicit else None, workers=workers)
+    assert Path(index_path).read_bytes() == b"not an index"
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_schema_scan_index_created_concurrently(tmp_path, monkeypatch, workers):
+    index_path = tmp_path / "raced.csi"
+    original_link = os.link
+
+    def racing_link(source, destination):
+        index_path.write_bytes(b"other writer")
+        return original_link(source, destination)
+
+    monkeypatch.setattr(os, "link", racing_link)
+    with pytest.raises(FileExistsError):
+        VCF(VCF_PATH).schema_scan(index_path=str(index_path), workers=workers)
+    assert index_path.read_bytes() == b"other writer"
+    assert not list(tmp_path.glob(".cyvcf2-index-*"))
+
+
+def test_schema_scan_indexed_long_overlapping_records(tmp_path, monkeypatch):
+    import cyvcf2.cyvcf2 as native
+    text_path = tmp_path / "long.vcf"
+    header = (
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=1,length=1000000>\n"
+        "##contig=<ID=2,length=1000000>\n"
+        '##INFO=<ID=END,Number=1,Type=Integer,Description="end">\n'
+        '##INFO=<ID=BLOB,Number=1,Type=String,Description="long value">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+    )
+    lines = [
+        "%s\t%d\t.\tA\t<DEL>\t.\tPASS\tEND=999999;BLOB=%s\n"
+        % (chrom, i * 10000 + 1, "A" * 180000)
+        for chrom in ("1", "2") for i in range(12)
+    ]
+    text_path.write_text(header + "".join(lines))
+    path = str(tmp_path / "long.vcf.gz")
+    with VCF(str(text_path)) as source:
+        writer = Writer(path, source, mode="wz")
+        for record in source:
+            writer.write_record(record)
+        writer.close()
+    expected = VCF(path).schema_scan()
+    index_path = path + ".csi"
+    VCF(path).schema_scan(index_path=index_path)
+    original = native._schema_index_ranges
+    plans = []
+
+    def recording_plan(*args):
+        result = original(*args)
+        plans.append(result)
+        return result
+
+    monkeypatch.setattr(native, "_schema_index_ranges", recording_plan)
+    result = VCF(path).schema_scan(workers=8)
+    result.pop("index")
+    expected.pop("index")
+    assert result == expected
+    assert any(len(ranges) > 1 for ranges, _ in plans)
+
+
+@pytest.mark.parametrize("corruption", ["boundary", "count"])
+def test_schema_scan_index_split_validation(tmp_path, monkeypatch, corruption):
+    import cyvcf2.cyvcf2 as native
+    bcf_path = _write_multiblock_bcf(tmp_path)
+    index_path = bcf_path + ".csi"
+    VCF(bcf_path).schema_scan(index_path=index_path)
+    original = native._schema_index_ranges
+
+    def corrupted_plan(*args):
+        ranges, count = original(*args)
+        assert len(ranges) > 1
+        if corruption == "count":
+            return ranges, count + 1
+        offset = ranges[1][0] + 1
+        ranges[0] = (ranges[0][0], offset, ranges[0][2])
+        ranges[1] = (offset, ranges[1][1], offset)
+        return ranges, count
+
+    monkeypatch.setattr(native, "_schema_index_ranges", corrupted_plan)
+    original_bytes = Path(index_path).read_bytes()
+    with pytest.raises((OSError, ValueError)):
+        VCF(bcf_path).schema_scan(workers=4)
+    assert Path(index_path).read_bytes() == original_bytes
+
+
+def test_schema_scan_includes_unused_header_fields(tmp_path):
+    path = tmp_path / "empty.vcf"
+    path.write_text(
+        "##fileformat=VCFv4.2\n"
+        "##contig=<ID=1>\n"
+        '##INFO=<ID=DP,Number=1,Type=Integer,Description="depth">\n'
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="genotype">\n'
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample\n"
+    )
+
+    summary = VCF(str(path)).schema_scan()
+    assert summary["records"] == 0
+    assert summary["fields"]["INFO"]["DP"]["records"] == 0
+    assert summary["fields"]["INFO"]["DP"]["cardinality"] == {
+        "min": None,
+        "max": None,
+    }
+    assert summary["fields"]["FORMAT"]["GT"]["records"] == 0
 
 def test_reader_context_manager():
     with VCF(VCF_PATH) as vcf:

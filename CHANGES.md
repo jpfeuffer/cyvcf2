@@ -1,7 +1,12 @@
 # v0.34.0
++ report logical comma-separated INFO/FORMAT String and Character cardinalities during schema scans
++ reuse existing CSI/TBI offsets for parallel schema scans and refuse index overwrites
 + drop support for end-of-life Python 3.8 (minimum is now 3.9)
 + add PyPI trove classifiers (Python 3.9–3.14)
 + bump cibuildwheel to v4 and drop the stale prerelease-pythons flag
++ add native schema scanning, parallel BGZF or uncompressed VCF/BCF workers, and optional index creation
++ select schema-scan CSI depth using HTSlib-compatible VCF/BCF contig-length rules
++ allow threads=0 to choose schema-scan workers using affinity and cgroup CPU limits
 
 # v0.33.0
 + modernize build system to use scikit-build-core (thanks @jhl-oai #327)

@@ -13,6 +13,7 @@ from array import array
 import math
 import ctypes
 import warnings
+import struct
 try:
   from pathlib import Path
 except ImportError:
@@ -29,6 +30,10 @@ ENC = locale.getpreferredencoding()
 from cython cimport view
 
 from cpython.version cimport PY_MAJOR_VERSION
+from cpython.bytes cimport (
+    PyBytes_FromStringAndSize,
+    PyBytes_AS_STRING,
+)
 
 def set_htslib_log_level(int level):
     """
@@ -194,6 +199,780 @@ cdef set_constants(VCF v):
         v.HOM_ALT = 3
 
 
+cdef struct SchemaFieldStats:
+    uint64_t records
+    uint64_t total_values
+    int min_cardinality
+    int max_cardinality
+    bint has_numeric
+    double min_value
+    double max_value
+    bint has_logical_cardinality
+    int min_logical_cardinality
+    int max_logical_cardinality
+
+
+cdef void _schema_string_cardinality(
+        SchemaFieldStats *stats, const uint8_t *data, int length) noexcept:
+    cdef int i
+    cdef int count = 0
+    # Count delimiters before decoding percent escapes; stop at BCF NUL padding.
+    for i in range(length):
+        if data[i] == 0:
+            break
+        if i == 0:
+            count = 1
+        if data[i] == 44:
+            count += 1
+    if not stats.has_logical_cardinality or count < stats.min_logical_cardinality:
+        stats.min_logical_cardinality = count
+    if not stats.has_logical_cardinality or count > stats.max_logical_cardinality:
+        stats.max_logical_cardinality = count
+    stats.has_logical_cardinality = True
+
+
+cdef struct SchemaIndexEntry:
+    int32_t rid
+    int64_t beg
+    int64_t end
+    uint64_t offset
+
+
+cdef bytes _schema_vcf_index_metadata(list contig_names):
+    cdef bytes names_blob
+    names_blob = b"".join(name + b"\0" for name in contig_names)
+    return struct.pack(
+        "<7I",
+        tbx_conf_vcf.preset,
+        tbx_conf_vcf.sc,
+        tbx_conf_vcf.bc,
+        tbx_conf_vcf.ec,
+        tbx_conf_vcf.meta_char,
+        tbx_conf_vcf.line_skip,
+        len(names_blob),
+    ) + names_blob
+
+
+cdef enum:
+    SCHEMA_BCF_INVALID = -1
+    SCHEMA_BCF_TRUNCATED = -2
+    SCHEMA_BCF_MASK_INFO = 1
+    SCHEMA_BCF_MASK_FLT = 2
+    SCHEMA_BCF_MASK_FMT = 4
+
+cdef int64_t SCHEMA_BCF_MAX_BLOCK = 1 << 30
+cdef int SCHEMA_BCF_REQUIRED_RECORDS = 4
+cdef int64_t SCHEMA_BCF_INITIAL_SEARCH = 1 << 20
+cdef int64_t SCHEMA_BCF_MAX_SEARCH = 64 << 20
+
+
+cdef inline int64_t _schema_raw_offset(int64_t offset) nogil:
+    # Uncompressed BGZF streams address bytes as (64 KiB read << 16) | offset;
+    # canonicalize so equal byte positions compare equal.
+    return ((offset >> 16) + (offset & 0xFFFF)) << 16
+
+
+cdef inline uint32_t _schema_u32(const uint8_t *data) nogil:
+    return (<uint32_t>data[0] | (<uint32_t>data[1] << 8) |
+            (<uint32_t>data[2] << 16) | (<uint32_t>data[3] << 24))
+
+
+cdef inline int _schema_bcf_type_size(int value_type) nogil:
+    if value_type == 0:
+        return 0
+    if value_type == 1 or value_type == 7:
+        return 1
+    if value_type == 2:
+        return 2
+    if value_type == 3 or value_type == 5:
+        return 4
+    return -1
+
+
+cdef inline int _schema_bcf_int(
+        const uint8_t *data, int64_t length, int64_t *cursor,
+        int64_t *value) nogil:
+    cdef int descriptor
+    cdef int value_type
+    cdef int size
+    if cursor[0] >= length:
+        return SCHEMA_BCF_TRUNCATED
+    descriptor = data[cursor[0]]
+    value_type = descriptor & 15
+    if descriptor >> 4 != 1 or value_type < 1 or value_type > 3:
+        return SCHEMA_BCF_INVALID
+    size = _schema_bcf_type_size(value_type)
+    if cursor[0] + 1 + size > length:
+        return SCHEMA_BCF_TRUNCATED
+    if value_type == 1:
+        value[0] = <int8_t>data[cursor[0] + 1]
+    elif value_type == 2:
+        value[0] = <int16_t>(
+            <uint16_t>data[cursor[0] + 1] | (<uint16_t>data[cursor[0] + 2] << 8))
+    else:
+        value[0] = <int32_t>_schema_u32(data + cursor[0] + 1)
+    cursor[0] += 1 + size
+    return 0
+
+
+cdef inline int _schema_bcf_typed(
+        const uint8_t *data, int64_t length, int64_t *cursor,
+        int *value_type, int64_t *count) nogil:
+    cdef int descriptor
+    cdef int status
+    if cursor[0] >= length:
+        return SCHEMA_BCF_TRUNCATED
+    descriptor = data[cursor[0]]
+    value_type[0] = descriptor & 15
+    count[0] = descriptor >> 4
+    if _schema_bcf_type_size(value_type[0]) < 0:
+        return SCHEMA_BCF_INVALID
+    cursor[0] += 1
+    if count[0] == 15:
+        status = _schema_bcf_int(data, length, cursor, count)
+        if status != 0:
+            return status
+        if count[0] < 15:
+            return SCHEMA_BCF_INVALID
+    if value_type[0] == 0 and count[0] != 0:
+        return SCHEMA_BCF_INVALID
+    return 0
+
+
+cdef inline int _schema_bcf_skip_typed(
+        const uint8_t *data, int64_t length, int64_t *cursor,
+        int64_t multiplier, int *value_type) nogil:
+    cdef int64_t count
+    cdef int status = _schema_bcf_typed(
+        data, length, cursor, value_type, &count)
+    if status != 0:
+        return status
+    cursor[0] += count * multiplier * _schema_bcf_type_size(value_type[0])
+    if cursor[0] > length:
+        return SCHEMA_BCF_INVALID
+    return 0
+
+
+cdef int64_t _schema_bcf_check_record(
+        const uint8_t *data, int64_t length, int64_t start,
+        int n_contigs, int n_samples, int n_ids,
+        const uint8_t *id_mask) nogil:
+    """Validate the complete structure of one BCF record at ``start``.
+
+    Returns the record length, SCHEMA_BCF_INVALID, or SCHEMA_BCF_TRUNCATED.
+    """
+    cdef int64_t shared_length
+    cdef int64_t indiv_length
+    cdef int64_t cursor
+    cdef int64_t shared_end
+    cdef int64_t indiv_end
+    cdef int64_t key
+    cdef int64_t count
+    cdef int64_t i
+    cdef int64_t j
+    cdef int32_t rid
+    cdef int32_t pos
+    cdef int32_t rlen
+    cdef uint32_t packed
+    cdef int n_info
+    cdef int n_allele
+    cdef int n_fmt
+    cdef int value_type
+    cdef int status
+    cdef int size
+
+    if start + 32 > length:
+        return SCHEMA_BCF_TRUNCATED
+    shared_length = _schema_u32(data + start)
+    indiv_length = _schema_u32(data + start + 4)
+    if (shared_length < 24 or shared_length > SCHEMA_BCF_MAX_BLOCK or
+            indiv_length > SCHEMA_BCF_MAX_BLOCK):
+        return SCHEMA_BCF_INVALID
+    cursor = start + 8
+    rid = <int32_t>_schema_u32(data + cursor)
+    pos = <int32_t>_schema_u32(data + cursor + 4)
+    rlen = <int32_t>_schema_u32(data + cursor + 8)
+    if rid < 0 or rid >= n_contigs or pos < -1 or rlen < 0:
+        return SCHEMA_BCF_INVALID
+    packed = _schema_u32(data + cursor + 16)
+    n_info = packed & 0xffff
+    n_allele = packed >> 16
+    packed = _schema_u32(data + cursor + 20)
+    n_fmt = packed >> 24
+    if <int>(packed & 0xffffff) != n_samples:
+        return SCHEMA_BCF_INVALID
+    if (n_fmt == 0) != (indiv_length == 0):
+        return SCHEMA_BCF_INVALID
+    shared_end = start + 8 + shared_length
+    indiv_end = shared_end + indiv_length
+    if indiv_end > length:
+        return SCHEMA_BCF_TRUNCATED
+    cursor += 24
+
+    status = _schema_bcf_skip_typed(data, shared_end, &cursor, 1, &value_type)
+    if status != 0 or (value_type != 7 and value_type != 0):
+        return SCHEMA_BCF_INVALID
+    for i in range(n_allele):
+        status = _schema_bcf_skip_typed(
+            data, shared_end, &cursor, 1, &value_type)
+        if status != 0 or (value_type != 7 and value_type != 0):
+            return SCHEMA_BCF_INVALID
+    status = _schema_bcf_typed(data, shared_end, &cursor, &value_type, &count)
+    if status != 0 or value_type == 5 or value_type == 7:
+        return SCHEMA_BCF_INVALID
+    size = _schema_bcf_type_size(value_type)
+    if cursor + count * size > shared_end:
+        return SCHEMA_BCF_INVALID
+    for j in range(count):
+        if size == 1:
+            key = <int8_t>data[cursor]
+        elif size == 2:
+            key = <int16_t>(<uint16_t>data[cursor] | (<uint16_t>data[cursor + 1] << 8))
+        else:
+            key = <int32_t>_schema_u32(data + cursor)
+        if key < 0 or key >= n_ids or not (id_mask[key] & SCHEMA_BCF_MASK_FLT):
+            return SCHEMA_BCF_INVALID
+        cursor += size
+    for i in range(n_info):
+        if _schema_bcf_int(data, shared_end, &cursor, &key) != 0:
+            return SCHEMA_BCF_INVALID
+        if key < 0 or key >= n_ids or not (id_mask[key] & SCHEMA_BCF_MASK_INFO):
+            return SCHEMA_BCF_INVALID
+        if _schema_bcf_skip_typed(
+                data, shared_end, &cursor, 1, &value_type) != 0:
+            return SCHEMA_BCF_INVALID
+    if cursor != shared_end:
+        return SCHEMA_BCF_INVALID
+
+    for i in range(n_fmt):
+        if _schema_bcf_int(data, indiv_end, &cursor, &key) != 0:
+            return SCHEMA_BCF_INVALID
+        if key < 0 or key >= n_ids or not (id_mask[key] & SCHEMA_BCF_MASK_FMT):
+            return SCHEMA_BCF_INVALID
+        if _schema_bcf_skip_typed(
+                data, indiv_end, &cursor, n_samples, &value_type) != 0:
+            return SCHEMA_BCF_INVALID
+    if cursor != indiv_end:
+        return SCHEMA_BCF_INVALID
+    return indiv_end - start
+
+
+cdef int64_t _schema_bcf_find_record_start(
+        const uint8_t *data, int64_t length, bint at_eof,
+        int n_contigs, int n_samples, int n_ids,
+        const uint8_t *id_mask) nogil:
+    """Return the first offset that begins a chain of valid BCF records.
+
+    Returns SCHEMA_BCF_INVALID if no candidate exists in ``data`` and
+    SCHEMA_BCF_TRUNCATED if more decompressed data is needed to decide.
+    """
+    cdef int64_t candidate
+    cdef int64_t cursor
+    cdef int64_t record_length
+    cdef int records
+
+    for candidate in range(length):
+        cursor = candidate
+        records = 0
+        while records < SCHEMA_BCF_REQUIRED_RECORDS:
+            if at_eof and cursor == length:
+                break
+            record_length = _schema_bcf_check_record(
+                data, length, cursor, n_contigs, n_samples, n_ids, id_mask)
+            if record_length == SCHEMA_BCF_TRUNCATED and not at_eof:
+                return SCHEMA_BCF_TRUNCATED
+            if record_length < 0:
+                break
+            cursor += record_length
+            records += 1
+        if records == SCHEMA_BCF_REQUIRED_RECORDS or (
+                records > 0 and at_eof and cursor == length):
+            return candidate
+    return SCHEMA_BCF_INVALID
+
+
+cdef int64_t _schema_bcf_locate_start(
+        BGZF *fp, bcf_hdr_t *hdr, int64_t block_start) except -2:
+    """Find the virtual offset of the first BCF record starting in a block.
+
+    Returns -1 when no record start could be identified within the search
+    budget; the caller then relies on the previous chunk's verified handoff.
+    """
+    cdef int n_ids = hdr.n[BCF_DT_ID]
+    cdef int n_contigs = hdr.n[BCF_DT_CTG]
+    cdef int n_samples = bcf_hdr_nsamples(hdr)
+    cdef uint8_t *id_mask = NULL
+    cdef uint8_t *data = NULL
+    cdef uint8_t *resized = NULL
+    cdef int64_t capacity = 0
+    cdef int64_t length = 0
+    cdef int64_t candidate = SCHEMA_BCF_TRUNCATED
+    cdef int64_t target
+    cdef ssize_t got
+    cdef bint at_eof = False
+    cdef int i
+
+    id_mask = <uint8_t *>stdlib.calloc(<size_t>max(n_ids, 1), 1)
+    if id_mask == NULL:
+        raise MemoryError()
+    try:
+        for i in range(n_ids):
+            if bcf_hdr_idinfo_exists(hdr, BCF_HL_INFO, i):
+                id_mask[i] |= SCHEMA_BCF_MASK_INFO
+            if bcf_hdr_idinfo_exists(hdr, BCF_HL_FLT, i):
+                id_mask[i] |= SCHEMA_BCF_MASK_FLT
+            if bcf_hdr_idinfo_exists(hdr, BCF_HL_FMT, i):
+                id_mask[i] |= SCHEMA_BCF_MASK_FMT
+        if bgzf_seek(fp, block_start, 0) < 0:
+            raise IOError("cannot seek to BGZF chunk")
+        target = SCHEMA_BCF_INITIAL_SEARCH
+        while candidate == SCHEMA_BCF_TRUNCATED:
+            if target > capacity:
+                resized = <uint8_t *>stdlib.realloc(data, <size_t>target)
+                if resized == NULL:
+                    raise MemoryError()
+                data = resized
+                capacity = target
+            with nogil:
+                got = bgzf_read(fp, data + length, <size_t>(target - length))
+            if got < 0:
+                raise IOError("error reading BCF chunk")
+            length += got
+            at_eof = length < target
+            with nogil:
+                candidate = _schema_bcf_find_record_start(
+                    data, length, at_eof, n_contigs, n_samples, n_ids, id_mask)
+            if candidate == SCHEMA_BCF_TRUNCATED:
+                if target >= SCHEMA_BCF_MAX_SEARCH:
+                    return -1
+                target *= 2
+        if candidate < 0:
+            return -1
+        if bgzf_seek(fp, block_start, 0) < 0:
+            raise IOError("cannot seek to BGZF chunk")
+        if candidate > 0:
+            with nogil:
+                got = bgzf_read(fp, data, <size_t>candidate)
+            if got != candidate:
+                raise IOError("error reading BCF chunk")
+        return bgzf_tell(fp)
+    finally:
+        stdlib.free(id_mask)
+        stdlib.free(data)
+
+
+cdef void _schema_index_settings(
+        const bcf_hdr_t *hdr, bint is_bcf, int index_format,
+        int *min_shift, int *n_levels) except *:
+    cdef int i
+    cdef uint64_t max_length = 0
+    cdef uint64_t max_position
+
+    min_shift[0] = 14
+    n_levels[0] = 5
+    if index_format == HTS_FMT_TBI:
+        return
+    for i in range(hdr.n[BCF_DT_CTG]):
+        if hdr.id[BCF_DT_CTG][i].val != NULL:
+            max_length = max(max_length, hdr.id[BCF_DT_CTG][i].val.info[0])
+
+    # Match HTSlib's bcf_index/tbx_index policies, including unknown lengths.
+    if is_bcf:
+        n_levels[0] = 0
+        if max_length == 0:
+            max_length = (<uint64_t>1 << 31) - 1
+    else:
+        n_levels[0] = 6
+        if max_length == 0:
+            n_levels[0] = 8
+            return
+
+    if max_length > (<uint64_t>1 << 62) - 256:
+        raise ValueError("contig length exceeds the supported CSI coordinate range")
+    max_length += 256
+    max_position = <uint64_t>1 << (min_shift[0] + 3 * n_levels[0])
+    while max_length > max_position:
+        if n_levels[0] < 9:
+            n_levels[0] += 1
+            max_position <<= 3
+        else:
+            min_shift[0] += 1
+            max_position <<= 1
+    if min_shift[0] != 14:
+        warnings.warn(
+            "Adjusted CSI min_shift from 14 to %d due to the longest contig"
+            % min_shift[0], RuntimeWarning)
+
+
+cdef class _SchemaIndexBuilder:
+    cdef hts_idx_t *index
+    cdef bytes fname
+    cdef bytes index_path
+    cdef int *rid_map
+    cdef int n_contigs
+    cdef int next_rid
+    cdef list header_contig_names
+    cdef list contig_names
+    cdef int index_format
+    cdef bint is_bcf
+    cdef bint finished
+
+    def __cinit__(self, path, index_path):
+        cdef htsFile *fp = NULL
+        cdef bcf_hdr_t *hdr = NULL
+        cdef int n_contigs = 0
+        cdef int contig_index = 0
+        cdef int min_shift = 14
+        cdef int n_levels = 5
+        cdef int64_t offset0 = 0
+        cdef const char *contig_name = NULL
+
+        self.index = NULL
+        self.rid_map = NULL
+        self.n_contigs = 0
+        self.next_rid = 0
+        self.header_contig_names = []
+        self.contig_names = []
+        self.finished = False
+        self.fname = to_bytes(path)
+        self.index_path = to_bytes(
+            str(index_path) if isinstance(index_path, Path) else index_path)
+        if self.fname == self.index_path:
+            raise ValueError("index_path must differ from the input path")
+        if b"://" in self.index_path:
+            raise ValueError("index creation requires a local destination for no-overwrite safety")
+        self.index_format = (
+            HTS_FMT_TBI if self.index_path.endswith(b".tbi") else HTS_FMT_CSI)
+
+        fp = hts_open(self.fname, b"r")
+        if fp == NULL:
+            raise IOError("Error opening %s" % path)
+        try:
+            if not fp.is_bgzf or fp.format.compression == no_compression:
+                raise ValueError("index creation requires BGZF-compressed VCF/BCF")
+            hdr = bcf_hdr_read(fp)
+            if hdr == NULL:
+                raise IOError("cannot parse VCF header")
+            if self.index_format == HTS_FMT_TBI and fp.format.format != vcf:
+                raise ValueError("TBI indexes can only be created for VCF files")
+            n_contigs = hdr.n[BCF_DT_CTG]
+            self.n_contigs = n_contigs
+            self.is_bcf = fp.format.format == bcf
+            self.rid_map = <int *>stdlib.malloc(
+                <size_t>n_contigs * sizeof(int))
+            if self.rid_map == NULL and n_contigs > 0:
+                raise MemoryError("unable to allocate contig mapping")
+            for contig_index in range(n_contigs):
+                self.rid_map[contig_index] = -1
+                contig_name = bcf_hdr_int2id(
+                    hdr, BCF_DT_CTG, contig_index)
+                if contig_name == NULL:
+                    raise ValueError("unable to read VCF contig name")
+                self.header_contig_names.append(<bytes>contig_name)
+            offset0 = bgzf_tell(fp.fp.bgzf)
+            _schema_index_settings(
+                hdr, self.is_bcf, self.index_format, &min_shift, &n_levels)
+            self.index = hts_idx_init(
+                n_contigs if self.is_bcf else 0, self.index_format,
+                <uint64_t>offset0, min_shift, n_levels)
+            if self.index == NULL:
+                raise MemoryError("unable to initialize index")
+        finally:
+            if hdr != NULL:
+                bcf_hdr_destroy(hdr)
+            if fp != NULL:
+                hts_close(fp)
+
+    def add_file(self, path):
+        cdef SchemaIndexEntry *entries
+        cdef SchemaIndexEntry entry
+        cdef Py_ssize_t entry_count
+        cdef Py_ssize_t entry_index
+        cdef int mapped_rid
+        cdef size_t chunk_size = (1 << 20) // sizeof(SchemaIndexEntry) * sizeof(SchemaIndexEntry)
+        cdef object source = open(path, "rb")
+        cdef bytes payload
+
+        try:
+            while True:
+                payload = source.read(chunk_size)
+                if not payload:
+                    break
+                if len(payload) % sizeof(SchemaIndexEntry) != 0:
+                    raise IOError("invalid chunk index entry file")
+                entries = <SchemaIndexEntry *>PyBytes_AS_STRING(payload)
+                entry_count = len(payload) // sizeof(SchemaIndexEntry)
+                for entry_index in range(entry_count):
+                    entry = entries[entry_index]
+                    if entry.rid < 0 or entry.rid >= self.n_contigs:
+                        raise ValueError("invalid contig ID in index entries")
+                    mapped_rid = entry.rid if self.is_bcf else self.rid_map[entry.rid]
+                    if mapped_rid < 0:
+                        mapped_rid = self.next_rid
+                        self.rid_map[entry.rid] = mapped_rid
+                        self.next_rid += 1
+                        self.contig_names.append(
+                            self.header_contig_names[entry.rid])
+                    if hts_idx_push(
+                            self.index, mapped_rid, entry.beg, entry.end,
+                            entry.offset, 1) < 0:
+                        raise ValueError(
+                            "cannot build index: records must be coordinate-sorted")
+        finally:
+            source.close()
+
+    def finish(self, int64_t final_offset):
+        cdef bytes metadata
+
+        if self.finished:
+            raise ValueError("index builder is already finished")
+        if final_offset < 0 or hts_idx_finish(
+                self.index, <uint64_t>final_offset) != 0:
+            raise ValueError("unable to finish index; input may not be coordinate-sorted")
+        if not self.is_bcf:
+            metadata = _schema_vcf_index_metadata(self.contig_names)
+            if hts_idx_set_meta(
+                    self.index, len(metadata),
+                    <uint8_t *>PyBytes_AS_STRING(metadata), 1) < 0:
+                raise MemoryError("unable to set tabix index metadata")
+        _schema_save_index(self.index, self.fname, self.index_path, self.index_format)
+        self.finished = True
+
+    def __dealloc__(self):
+        if self.index != NULL:
+            hts_idx_destroy(self.index)
+        if self.rid_map != NULL:
+            stdlib.free(self.rid_map)
+
+
+def _schema_bgzf_ranges(path, int workers):
+    import bisect
+    import struct
+
+    file_size = os.path.getsize(path)
+    block_offsets = []
+    with open(path, "rb") as source:
+        magic = source.read(4)
+        if magic[:2] != b"\x1f\x8b":
+            # Uncompressed BCF/VCF can be split at any byte; workers locate and
+            # verify record starts exactly as for BGZF blocks.
+            data_start = 0
+            if magic != b"BCF\x02":
+                source.seek(0)
+                for line in source:
+                    if not line.startswith(b"#"):
+                        break
+                    data_start += len(line)
+            boundaries = sorted(set(
+                data_start + (file_size - data_start) * worker // workers
+                for worker in range(1, workers)))
+            boundaries = [offset for offset in boundaries if data_start < offset < file_size]
+            starts = [-1] + [offset << 16 for offset in boundaries]
+            ends = [offset << 16 for offset in boundaries] + [(1 << 63) - 1]
+            # Text workers seek one byte early to tell whether the boundary
+            # already starts a line.
+            return [
+                (start, end, -1 if start < 0 else ((start >> 16) - 1) << 16)
+                for start, end in zip(starts, ends)
+            ]
+        offset = 0
+        while offset < file_size:
+            source.seek(offset)
+            fixed = source.read(12)
+            if len(fixed) != 12 or fixed[:2] != b"\x1f\x8b" or not (fixed[3] & 4):
+                raise ValueError("parallel schema scanning requires BGZF input")
+            extra_length = struct.unpack("<H", fixed[10:12])[0]
+            extra = source.read(extra_length)
+            if len(extra) != extra_length:
+                raise IOError("truncated BGZF extra header")
+            block_size = None
+            cursor = 0
+            while cursor + 4 <= extra_length:
+                subfield_length = struct.unpack("<H", extra[cursor + 2:cursor + 4])[0]
+                subfield_end = cursor + 4 + subfield_length
+                if subfield_end > extra_length:
+                    raise IOError("invalid BGZF extra subfield")
+                if extra[cursor:cursor + 2] == b"BC" and subfield_length == 2:
+                    block_size = struct.unpack("<H", extra[cursor + 4:subfield_end])[0] + 1
+                    break
+                cursor = subfield_end
+            if block_size is None or block_size < 18 or offset + block_size > file_size:
+                raise IOError("invalid BGZF block header")
+            block_offsets.append(offset)
+            offset += block_size
+
+    if not block_offsets:
+        raise ValueError("empty BGZF input")
+    target_offsets = [
+        file_size * worker // workers
+        for worker in range(1, workers)
+    ]
+    boundaries = []
+    target_index = 0
+    for block_offset in block_offsets:
+        while target_index < len(target_offsets) and block_offset >= target_offsets[target_index]:
+            if not boundaries or boundaries[-1] != block_offset:
+                boundaries.append(block_offset)
+            target_index += 1
+    boundaries = [offset for offset in boundaries if offset < file_size]
+    starts = [-1] + [offset << 16 for offset in boundaries]
+    ends = [offset << 16 for offset in boundaries] + [(1 << 63) - 1]
+    ranges = []
+    for i, (start, end) in enumerate(zip(starts, ends)):
+        if start < 0:
+            seek_offset = -1
+        else:
+            block_index = bisect.bisect_left(block_offsets, start >> 16)
+            seek_offset = block_offsets[max(0, block_index - 1)] << 16
+        ranges.append((start, end, seek_offset))
+    return ranges
+
+
+def _schema_scan_worker(args):
+    (path, start, end, seek, threads, collect_index, index_entries_path,
+     exact_start) = args
+    reader = VCF(path)
+    try:
+        return reader._schema_scan_chunk(
+            start, end, seek, threads, collect_index, index_entries_path,
+            exact_start)
+    finally:
+        reader.close()
+
+
+def _schema_index_is_available(path, index_path=None, is_bcf=False):
+    from ._schema_scan import _index_split_offsets
+    cdef bytes fname = to_bytes(path)
+    cdef bytes idxname
+    cdef hts_idx_t *index = NULL
+    cdef tbx_t *tbx = NULL
+    cdef list candidates
+
+    if index_path is not None:
+        idxname = to_bytes(
+            str(index_path) if isinstance(index_path, Path) else index_path)
+        if fname == idxname:
+            raise ValueError("index_path must differ from the input path")
+        if not os.path.lexists(index_path):
+            return False
+        candidates = [idxname]
+    else:
+        candidates = [fname + b".csi"] if is_bcf else [fname + b".csi", fname + b".tbi"]
+    for idxname in candidates:
+        if not os.path.lexists(idxname):
+            continue
+        if not is_bcf:
+            tbx = tbx_index_load2(fname, idxname)
+            if tbx != NULL:
+                valid = (tbx.conf.preset == tbx_conf_vcf.preset and
+                         tbx.conf.sc == tbx_conf_vcf.sc and
+                         tbx.conf.bc == tbx_conf_vcf.bc and
+                         tbx.conf.ec == tbx_conf_vcf.ec)
+                tbx_destroy(tbx)
+                if not valid:
+                    raise OSError("existing index is not a VCF index")
+                _index_split_offsets(idxname, os.path.getsize(fname), 1, is_bcf)
+                return True
+        else:
+            index = hts_idx_load2(fname, idxname)
+            if index != NULL:
+                hts_idx_destroy(index)
+                _index_split_offsets(idxname, os.path.getsize(fname), 1, is_bcf)
+                return True
+        raise OSError("unable to read existing index: %s" % os.fsdecode(idxname))
+    return False
+
+
+cdef void _schema_save_index(
+        hts_idx_t *index, bytes fname, bytes destination, int index_format) except *:
+    if b"://" in destination:
+        raise ValueError("index creation requires a local destination for no-overwrite safety")
+    directory = os.path.dirname(os.path.abspath(destination))
+    with tempfile.TemporaryDirectory(prefix=b".cyvcf2-index-", dir=directory) as temporary:
+        staging = os.path.join(temporary, b"index")
+        if hts_idx_save_as(index, fname, staging, index_format) < 0:
+            raise IOError("unable to save index to %s" % os.fsdecode(destination))
+        # Linking is atomic and fails if another writer created the destination.
+        os.link(staging, destination)
+
+
+def _schema_index_ranges(path, index_path, int workers):
+    cdef htsFile *fp = NULL
+    cdef bcf_hdr_t *hdr = NULL
+    cdef int64_t header_end
+    cdef bytes fname = to_bytes(path)
+    from ._schema_scan import _index_split_offsets
+    fp = hts_open(fname, b"r")
+    if fp == NULL:
+        raise IOError("unable to open input for indexed splitting")
+    try:
+        if not fp.is_bgzf or fp.format.compression == no_compression:
+            raise ValueError("indexed splitting requires BGZF-compressed VCF/BCF")
+        hdr = bcf_hdr_read(fp)
+        if hdr == NULL:
+            raise IOError("cannot parse VCF/BCF header")
+        boundaries, records = _index_split_offsets(
+            index_path, os.path.getsize(path), workers, fp.format.format == bcf)
+        header_end = bgzf_tell(fp.fp.bgzf)
+    finally:
+        if hdr != NULL:
+            bcf_hdr_destroy(hdr)
+        hts_close(fp)
+    boundaries = [offset for offset in boundaries if offset > header_end]
+    starts = [-1] + boundaries
+    ends = boundaries + [(1 << 63) - 1]
+    return [(start, end, start) for start, end in zip(starts, ends)], records
+
+
+def _merge_schema_scan_summaries(summaries):
+    merged = summaries[0]
+    merged["records"] = sum(summary["records"] for summary in summaries)
+    for summary in summaries[1:]:
+        for key, count in summary["alleles_per_record"].items():
+            merged["alleles_per_record"][key] = (
+                merged["alleles_per_record"].get(key, 0) + count)
+        merged["allele_counts"]["missing"] += summary["allele_counts"]["missing"]
+        counts = merged["allele_counts"]["by_index"]
+        for i, count in enumerate(summary["allele_counts"]["by_index"]):
+            if i >= len(counts):
+                counts.extend([0] * (i + 1 - len(counts)))
+            counts[i] += count
+        for ploidy, count in summary["ploidy"].items():
+            merged["ploidy"][ploidy] = merged["ploidy"].get(ploidy, 0) + count
+        for section in ("INFO", "FORMAT"):
+            for name, field in summary["fields"][section].items():
+                target = merged["fields"][section][name]
+                target["records"] += field["records"]
+                target["total_values"] += field["total_values"]
+                if field["cardinality"]["min"] is not None:
+                    current_min = target["cardinality"]["min"]
+                    current_max = target["cardinality"]["max"]
+                    target["cardinality"]["min"] = (
+                        field["cardinality"]["min"] if current_min is None
+                        else min(current_min, field["cardinality"]["min"]))
+                    target["cardinality"]["max"] = (
+                        field["cardinality"]["max"] if current_max is None
+                        else max(current_max, field["cardinality"]["max"]))
+                if "logical_cardinality" in field:
+                    logical = field["logical_cardinality"]
+                    if logical["min"] is not None:
+                        current = target["logical_cardinality"]
+                        current["min"] = (
+                            logical["min"] if current["min"] is None
+                            else min(current["min"], logical["min"]))
+                        current["max"] = (
+                            logical["max"] if current["max"] is None
+                            else max(current["max"], logical["max"]))
+                bounds = field["numeric_bounds"]
+                if bounds is not None:
+                    current = target["numeric_bounds"]
+                    if current is None:
+                        target["numeric_bounds"] = dict(bounds)
+                    else:
+                        current["min"] = min(current["min"], bounds["min"])
+                        current["max"] = max(current["max"], bounds["max"])
+    return merged
+
 
 cdef class HTSFile:
 
@@ -300,6 +1079,9 @@ cdef class VCF(HTSFile):
     cdef bint gts012
     cdef bint lazy
     cdef bint strict_gt
+    cdef object _schema_chunk
+    cdef object _schema_chunk_index_path
+    cdef bint _schema_collect_chunk_index
     cdef list _seqnames
     cdef list _seqlens
     # holds a lookup of format field -> type.
@@ -316,6 +1098,9 @@ cdef class VCF(HTSFile):
 
     def __init__(self, fname, mode="r", gts012=False, lazy=False, strict_gt=False, samples=None, threads=None):
         cdef bcf_hdr_t *hdr
+        self._schema_chunk = None
+        self._schema_chunk_index_path = None
+        self._schema_collect_chunk_index = False
         self._open_htsfile(fname, mode)
         hdr = self.hdr = bcf_hdr_read(self.hts)
         if hdr == NULL:
@@ -460,7 +1245,7 @@ cdef class VCF(HTSFile):
             hts_idx_destroy(self.hidx)
             self.hidx = NULL
 
-        if index_path.endswith(".tbi"):
+        if index_path.endswith((".tbi", ".csi")):
             self.idx = tbx_index_load2(to_bytes(self.fname), to_bytes(index_path))
             if self.idx != NULL:
                 return
@@ -470,6 +1255,794 @@ cdef class VCF(HTSFile):
             self.idx = tbx_index_load2(to_bytes(self.fname), to_bytes(index_path))
         if self.hidx == NULL and self.idx == NULL:
           raise OSError("unable to open index:'%s' for '%s'" % (index_path, self.fname))
+
+    def _schema_scan_chunk(
+            self, start, end, seek, threads, collect_index, index_entries_path,
+            exact_start=False):
+        self._schema_chunk = (start, end, seek, exact_start)
+        self._schema_collect_chunk_index = collect_index
+        self._schema_chunk_index_path = index_entries_path
+        try:
+            return self.schema_scan(threads=threads)
+        finally:
+            self._schema_chunk = None
+            self._schema_collect_chunk_index = False
+            self._schema_chunk_index_path = None
+
+    def schema_scan(self, index_path=None, threads=None, workers=None):
+        """Scan the complete VCF/BCF and return compact field statistics.
+
+        ``index_path`` may name an existing index to reuse, or a destination
+        where an index will be built during this scan if it does not exist.
+        No index is created when ``index_path`` is ``None``. Index creation
+        requires a BGZF-compressed, coordinate-sorted input file.
+        Existing indexes are never overwritten. Unreadable or invalid local
+        indexes raise an error. Newly built indexes require a local destination
+        and fail if that destination is created concurrently.
+        ``threads=0`` opts into automatic concurrency: half the available CPU
+        budget (honoring affinity and Linux cgroups) is used for workers,
+        each with one decompression thread. A one-CPU budget decodes
+        synchronously. An explicit ``workers`` overrides automatic selection.
+        Otherwise ``workers`` defaults to one and positive ``threads`` sets
+        the number of HTSlib decompression threads per worker.
+        ``workers`` parallelizes local BGZF-compressed or uncompressed VCF/BCF
+        scans across independent file ranges (indexing requires BGZF).
+        An existing local CSI/TBI supplies record-offset split hints instead
+        of BGZF block discovery. All records are still scanned; split boundaries
+        and available index record counts are checked. Sparse indexes may yield
+        fewer workers. Without an index the existing byte/block splitter is used.
+        String and Character field summaries also contain ``logical_cardinality``
+        (comma-separated element counts, excluding NUL padding). GT is excluded;
+        its allele-vector cardinality and actual ploidy are reported separately.
+        VCF workers start at the first line in their range; BCF workers locate
+        their first record by
+        structural validation; every range start is verified against the
+        previous range's end and rescanned from the verified offset if needed. Requested index entries are merged in file
+        order and written after all ranges have completed.
+        """
+        cdef htsFile *scan_hts = NULL
+        cdef bcf_hdr_t *scan_hdr = NULL
+        cdef bcf1_t *record = NULL
+        cdef hts_idx_t *index = NULL
+        cdef tbx_t *existing_tbx = NULL
+        cdef hts_idx_t *existing_index = NULL
+        cdef SchemaFieldStats *field_stats = NULL
+        cdef SchemaIndexEntry *chunk_entries = NULL
+        cdef int32_t *genotypes = NULL
+        cdef int32_t *int_values = NULL
+        cdef float *float_values = NULL
+        cdef int *index_rid_map = NULL
+        cdef uint64_t *allele_counts = NULL
+        cdef uint64_t *alleles_per_record = NULL
+        cdef uint64_t *ploidy_counts = NULL
+        cdef int genotype_capacity = 0
+        cdef int int_capacity = 0
+        cdef int float_capacity = 0
+        cdef int allele_capacity = 0
+        cdef int alleles_per_record_capacity = 0
+        cdef int ploidy_capacity = 0
+        cdef size_t chunk_entry_capacity = 0
+        cdef uint64_t *resized_counts = NULL
+        cdef int n_fields = 0
+        cdef int n_contigs = 0
+        cdef int n_samples = 0
+        cdef int ret = 0
+        cdef int n_values = 0
+        cdef int n_genotypes = 0
+        cdef int stride = 0
+        cdef int sample_index = 0
+        cdef int value_index = 0
+        cdef int field_index = 0
+        cdef int field_type = 0
+        cdef int cardinality = 0
+        cdef int ploidy = 0
+        cdef int allele_index = 0
+        cdef int index_format = HTS_FMT_CSI
+        cdef int index_status = 0
+        cdef int indexed_rid = 0
+        cdef int min_shift = 14
+        cdef int n_levels = 5
+        cdef uint64_t record_count = 0
+        cdef uint64_t missing_genotype_alleles = 0
+        cdef int64_t record_offset = 0
+        cdef int64_t index_offset = 0
+        cdef int64_t final_offset = 0
+        cdef int64_t chunk_start = -1
+        cdef int64_t chunk_final_offset = 0
+        cdef size_t chunk_entry_count = 0
+        cdef const char *tag = NULL
+        cdef bytes index_path_bytes
+        cdef bytes index_metadata
+        cdef list index_contig_names = []
+        cdef bint build_index = False
+        cdef bint index_available = False
+        cdef bint index_created = False
+        cdef bint local_index_exists = False
+        cdef bint is_info
+        cdef double numeric_value
+        cdef SchemaFieldStats *stats
+        cdef bcf_fmt_t *string_format
+        cdef kstring_t chunk_line
+        cdef BGZF *chunk_fp = NULL
+        cdef BGZF *text_fp = NULL
+        cdef int64_t header_end = 0
+        cdef bint chunk_start_found = False
+        cdef bint chunked
+        cdef bint chunked_vcf = False
+        cdef bint raw_chunk = False
+        cdef object chunk_actual_start = None
+        cdef bint collect_chunk_index
+        cdef object chunk_payload = None
+        cdef object chunk_index_stream = None
+        cdef object chunk_config
+
+        chunked = self._schema_chunk is not None
+        collect_chunk_index = self._schema_collect_chunk_index
+        chunk_config = self._schema_chunk
+        if chunked:
+            _chunk_start, _chunk_end, _seek_offset, _exact_start = chunk_config
+            _chunk_index_path = self._schema_chunk_index_path
+        if workers is not None and (not isinstance(workers, int) or workers < 1):
+            raise ValueError("workers must be a positive integer")
+        if threads is not None and (not isinstance(threads, int) or threads < 0):
+            raise ValueError("threads must be a non-negative integer")
+        if threads == 0:
+            from ._schema_scan import _available_cpu_count
+            cpu_budget = _available_cpu_count()
+            if workers is None:
+                workers = (
+                    max(1, cpu_budget // 2)
+                    if self.fname is not None and b"://" not in self.fname
+                    else 1
+                )
+            threads = 1 if cpu_budget >= 2 else None
+        if workers is None:
+            workers = 1
+        if workers > 1 and not chunked:
+            if self.fname is None:
+                raise ValueError("parallel schema_scan requires a VCF filename")
+            if b"://" in self.fname:
+                raise ValueError("parallel schema_scan currently requires a local BGZF VCF/BCF")
+            is_bcf = self.hts.format.format == bcf
+            if (index_path is not None and
+                    self.hts.format.compression == no_compression and
+                    not _schema_index_is_available(self.fname, index_path, is_bcf)):
+                raise ValueError("index creation requires BGZF-compressed VCF/BCF")
+            index_available = _schema_index_is_available(
+                self.fname, index_path, is_bcf)
+            build_index = index_path is not None and not index_available
+            source_path = os.fsdecode(self.fname)
+            split_index = None
+            expected_records = None
+            if index_available:
+                split_index = index_path
+                if split_index is None:
+                    split_index = next(
+                        candidate for candidate in
+                        ([self.fname + b".csi"] if is_bcf else
+                         [self.fname + b".csi", self.fname + b".tbi"])
+                        if os.path.lexists(candidate))
+                ranges, expected_records = _schema_index_ranges(
+                    source_path, split_index, workers)
+            else:
+                ranges = _schema_bgzf_ranges(source_path, workers)
+            if is_bcf:
+                ranges = [(start, end, start) for start, end, _ in ranges]
+            from concurrent.futures import ProcessPoolExecutor
+            from multiprocessing import get_context
+            from tempfile import TemporaryDirectory
+            chunk_summaries = []
+            with TemporaryDirectory(prefix="cyvcf2-schema-scan-") as workdir:
+                tasks = [
+                    (
+                        source_path, start, end, seek, threads,
+                        build_index,
+                        os.path.join(workdir, "chunk-%d.idx" % i)
+                        if build_index else None,
+                        split_index is not None,
+                    )
+                    for i, (start, end, seek) in enumerate(ranges)
+                ]
+                builder = (
+                    _SchemaIndexBuilder(self.fname, index_path)
+                    if build_index else None
+                )
+                with ProcessPoolExecutor(
+                        max_workers=len(tasks),
+                        mp_context=get_context("spawn")) as pool:
+                    futures = [
+                        pool.submit(_schema_scan_worker, task)
+                        for task in tasks
+                    ]
+                    expected_start = None
+                    for i, future in enumerate(futures):
+                        chunk_summary = future.result()
+                        if (i > 0 and
+                                chunk_summary["_actual_start"] != expected_start):
+                            if split_index is not None:
+                                raise OSError("index split does not match a record boundary")
+                            # The located start disagrees with where the
+                            # previous range ended; rescan from the verified offset.
+                            task = list(tasks[i])
+                            task[1] = expected_start
+                            task[3] = expected_start
+                            task[7] = True
+                            chunk_summary = pool.submit(
+                                _schema_scan_worker, tuple(task)).result()
+                        expected_start = chunk_summary.pop("_next_start")
+                        chunk_summary.pop("_actual_start")
+                        final_offset = chunk_summary.pop("_final_offset")
+                        if build_index:
+                            builder.add_file(
+                                chunk_summary.pop("_index_entries_path"))
+                        chunk_summaries.append(chunk_summary)
+                if build_index:
+                    builder.finish(final_offset)
+            summary = _merge_schema_scan_summaries(chunk_summaries)
+            if expected_records is not None and summary["records"] != expected_records:
+                raise OSError("index record count does not match the input")
+            if build_index:
+                index_available = True
+                index_created = True
+            summary["index"] = {
+                "available": bool(index_available),
+                "built": bool(index_created),
+                "path": str(index_path) if index_path is not None else None,
+            }
+            return summary
+
+        chunk_line.s = NULL
+        chunk_line.l = 0
+        chunk_line.m = 0
+
+        if self.fname is None:
+            raise ValueError("schema_scan requires a VCF/BCF filename")
+
+        if b"://" not in self.fname:
+            _schema_index_is_available(
+                self.fname, index_path, self.hts.format.format == bcf)
+        scan_hts = hts_open(self.fname, b"r")
+        if scan_hts == NULL:
+            raise IOError("Error opening %s" % self.fname)
+        try:
+            if threads is not None:
+                ret = hts_set_threads(scan_hts, threads)
+                if ret < 0:
+                    raise IOError("error setting number of threads: %d" % ret)
+
+            scan_hdr = bcf_hdr_read(scan_hts)
+            if scan_hdr == NULL:
+                raise IOError("cannot parse VCF header")
+            n_fields = scan_hdr.n[BCF_DT_ID]
+            n_contigs = scan_hdr.n[BCF_DT_CTG]
+            n_samples = bcf_hdr_nsamples(scan_hdr)
+            if chunked:
+                if scan_hts.format.format != vcf and scan_hts.format.format != bcf:
+                    raise ValueError("parallel schema_scan requires a VCF/BCF")
+                chunked_vcf = scan_hts.format.format == vcf
+                raw_chunk = scan_hts.format.compression == no_compression
+                if not scan_hts.is_bgzf and not (chunked_vcf and raw_chunk):
+                    raise ValueError("parallel schema_scan requires a BGZF-compressed or uncompressed VCF/BCF")
+                if scan_hts.is_bgzf:
+                    chunk_fp = scan_hts.fp.bgzf
+                    header_end = bgzf_tell(chunk_fp)
+                else:
+                    # Plain-text VCF: BGZF passes uncompressed data through
+                    # with seekable (canonicalized) virtual offsets.
+                    header_end = htell(scan_hts.fp.hfile) << 16
+                    text_fp = bgzf_open(self.fname, b"r")
+                    if text_fp == NULL:
+                        raise IOError("Error opening %s" % self.fname)
+                    chunk_fp = text_fp
+                if raw_chunk:
+                    header_end = _schema_raw_offset(header_end)
+                chunk_start = (
+                    header_end
+                    if _chunk_start is None or _chunk_start < 0
+                    else _chunk_start
+                )
+                if raw_chunk:
+                    chunk_start = _schema_raw_offset(chunk_start)
+                chunk_actual_start = chunk_start
+                if not chunked_vcf and _chunk_start is not None and _chunk_start >= 0:
+                    if not _exact_start:
+                        chunk_start = _schema_bcf_locate_start(
+                            chunk_fp, scan_hdr, _chunk_start)
+                        if raw_chunk and chunk_start >= 0:
+                            chunk_start = _schema_raw_offset(chunk_start)
+                        chunk_actual_start = chunk_start if chunk_start >= 0 else None
+                        if chunk_start < 0:
+                            chunk_start = _chunk_end
+                    if chunk_start < _chunk_end:
+                        if bgzf_seek(chunk_fp, chunk_start, 0) < 0:
+                            raise IOError("cannot seek to BCF record")
+                elif chunked_vcf:
+                    if chunk_start < header_end:
+                        chunk_start = header_end
+                    # The actual start is the first line at or after chunk_start.
+                    chunk_actual_start = None
+                    if _exact_start:
+                        _seek_offset = chunk_start
+                    if _seek_offset is not None and _seek_offset >= 0 and _seek_offset < chunk_start:
+                        if bgzf_seek(chunk_fp, _seek_offset, 0) < 0:
+                            raise IOError("cannot seek to VCF chunk")
+                    elif ((_schema_raw_offset(bgzf_tell(chunk_fp)) if raw_chunk
+                           else bgzf_tell(chunk_fp)) != chunk_start and
+                          bgzf_seek(chunk_fp, chunk_start, 0) < 0):
+                        raise IOError("cannot seek to VCF chunk")
+                if collect_chunk_index:
+                    if _chunk_index_path is None:
+                        raise ValueError("parallel index scan requires an index-entry path")
+                    chunk_index_stream = open(_chunk_index_path, "wb")
+                    chunk_entry_capacity = 65536
+                    chunk_entries = <SchemaIndexEntry *>stdlib.malloc(
+                        chunk_entry_capacity * sizeof(SchemaIndexEntry))
+                    if chunk_entries == NULL:
+                        raise MemoryError()
+            field_stats = <SchemaFieldStats *>stdlib.calloc(
+                <size_t>(2 * n_fields), sizeof(SchemaFieldStats))
+            if field_stats == NULL and n_fields > 0:
+                raise MemoryError()
+
+            if not chunked and index_path is not None:
+                index_path_bytes = to_bytes(str(index_path) if isinstance(index_path, Path) else index_path)
+                if index_path_bytes == self.fname:
+                    raise ValueError("index_path must differ from the input path")
+                if index_path_bytes.endswith(b".tbi"):
+                    index_format = HTS_FMT_TBI
+                local_index_exists = os.path.lexists(index_path)
+                if local_index_exists or b"://" in index_path_bytes:
+                    existing_index = hts_idx_load2(self.fname, index_path_bytes)
+                    if existing_index != NULL:
+                        index_available = True
+                        hts_idx_destroy(existing_index)
+                        existing_index = NULL
+                    elif local_index_exists:
+                        raise OSError("unable to read existing index: %s" % index_path)
+                    else:
+                        build_index = True
+                else:
+                    build_index = True
+            elif not chunked and scan_hts.format.format == bcf:
+                if (b"://" in self.fname or
+                        os.path.exists(self.fname + b".csi")):
+                    existing_index = bcf_index_load(self.fname)
+                    if existing_index != NULL:
+                        index_available = True
+                        hts_idx_destroy(existing_index)
+                        existing_index = NULL
+            elif not chunked:
+                if (b"://" in self.fname or
+                        os.path.exists(self.fname + b".csi") or
+                        os.path.exists(self.fname + b".tbi")):
+                    existing_tbx = tbx_index_load(self.fname)
+                    if (existing_tbx == NULL and
+                            os.path.exists(self.fname + b".csi")):
+                        existing_tbx = tbx_index_load2(
+                            self.fname, self.fname + b".csi")
+                    if existing_tbx != NULL:
+                        index_available = True
+                        tbx_destroy(existing_tbx)
+                        existing_tbx = NULL
+
+            if build_index:
+                if b"://" in index_path_bytes:
+                    raise ValueError("index creation requires a local destination for no-overwrite safety")
+                if not scan_hts.is_bgzf or scan_hts.format.compression == no_compression:
+                    raise ValueError("index creation requires BGZF-compressed VCF/BCF")
+                if index_format == HTS_FMT_TBI and scan_hts.format.format != vcf:
+                    raise ValueError("TBI indexes can only be created for VCF files")
+                _schema_index_settings(
+                    scan_hdr, scan_hts.format.format == bcf, index_format,
+                    &min_shift, &n_levels)
+                index = hts_idx_init(
+                    0 if scan_hts.format.format == vcf else n_contigs,
+                    index_format, <uint64_t>bgzf_tell(scan_hts.fp.bgzf),
+                    min_shift, n_levels)
+                if index == NULL:
+                    raise MemoryError("unable to initialize index")
+                if scan_hts.format.format == vcf:
+                    index_rid_map = <int *>stdlib.malloc(
+                        <size_t>n_contigs * sizeof(int))
+                    if index_rid_map == NULL and n_contigs > 0:
+                        raise MemoryError("unable to allocate contig mapping")
+                    for field_index in range(n_contigs):
+                        index_rid_map[field_index] = -1
+            record = bcf_init()
+            if record == NULL:
+                raise MemoryError("unable to initialize VCF record")
+            if chunk_fp == NULL and scan_hts.is_bgzf:
+                chunk_fp = scan_hts.fp.bgzf
+            while True:
+                if build_index or chunked:
+                    record_offset = bgzf_tell(chunk_fp)
+                    if raw_chunk:
+                        record_offset = _schema_raw_offset(record_offset)
+                if chunked and not chunked_vcf and chunk_start >= _chunk_end:
+                    record_offset = chunk_start
+                    break
+                if chunked_vcf and not chunk_start_found and record_offset >= chunk_start:
+                    chunk_start_found = True
+                    chunk_actual_start = record_offset
+                if chunked and record_offset >= _chunk_end:
+                    break
+                if chunked_vcf:
+                    with nogil:
+                        ret = bgzf_getline(chunk_fp, 10, &chunk_line)
+                    if ret < 0:
+                        if ret == -1:
+                            break
+                        raise IOError("error reading VCF chunk")
+                    if record_offset < chunk_start:
+                        continue
+                    with nogil:
+                        ret = vcf_parse(&chunk_line, scan_hdr, record)
+                    if ret != 0:
+                        raise IOError("unable to parse VCF record in chunk")
+                with nogil:
+                    if not chunked_vcf:
+                        ret = bcf_read(scan_hts, scan_hdr, record)
+                if not chunked_vcf:
+                    if ret == -1:
+                        break
+                    if ret < 0:
+                        raise IOError("error reading VCF/BCF record (error-code: %d)" % ret)
+
+                if build_index or collect_chunk_index:
+                    index_offset = bgzf_tell(chunk_fp)
+                    if index_offset < 0:
+                        raise IOError("unable to read BGZF virtual offset")
+                if build_index:
+                    indexed_rid = record.rid
+                    if indexed_rid < 0 or indexed_rid >= n_contigs:
+                        raise ValueError(
+                            "cannot index a record with an undefined contig")
+                    if scan_hts.format.format == vcf:
+                        if index_rid_map[indexed_rid] < 0:
+                            index_rid_map[indexed_rid] = len(index_contig_names)
+                            tag = bcf_hdr_int2id(
+                                scan_hdr, BCF_DT_CTG, indexed_rid)
+                            if tag == NULL:
+                                raise ValueError("unable to read VCF contig name")
+                            index_contig_names.append(<bytes>tag)
+                        indexed_rid = index_rid_map[indexed_rid]
+                    if hts_idx_push(
+                            index, indexed_rid, record.pos,
+                            record.pos + record.rlen, <uint64_t>index_offset, 1) < 0:
+                        raise ValueError(
+                            "cannot build index: records must have defined contigs "
+                            "and be coordinate-sorted")
+                if collect_chunk_index:
+                    if record.rid < 0:
+                        raise ValueError("cannot index a record with an undefined contig")
+                    if chunk_entry_count == chunk_entry_capacity:
+                        chunk_payload = PyBytes_FromStringAndSize(
+                            <char *>chunk_entries,
+                            <Py_ssize_t>(chunk_entry_count * sizeof(SchemaIndexEntry)))
+                        chunk_index_stream.write(chunk_payload)
+                        chunk_entry_count = 0
+                    chunk_entries[chunk_entry_count].rid = record.rid
+                    chunk_entries[chunk_entry_count].beg = record.pos
+                    chunk_entries[chunk_entry_count].end = record.pos + record.rlen
+                    chunk_entries[chunk_entry_count].offset = <uint64_t>index_offset
+                    chunk_entry_count += 1
+
+                if bcf_unpack(record, 15) != 0:
+                    raise IOError("unable to unpack VCF/BCF record")
+                record_count += 1
+
+                if record.n_allele > alleles_per_record_capacity:
+                    resized_counts = <uint64_t *>stdlib.realloc(
+                        alleles_per_record, <size_t>record.n_allele * sizeof(uint64_t))
+                    if resized_counts == NULL:
+                        raise MemoryError()
+                    alleles_per_record = resized_counts
+                    for value_index in range(alleles_per_record_capacity, record.n_allele):
+                        alleles_per_record[value_index] = 0
+                    alleles_per_record_capacity = record.n_allele
+                if record.n_allele > 0:
+                    alleles_per_record[record.n_allele - 1] += 1
+
+                for value_index in range(record.n_info):
+                    field_index = record.d.info[value_index].key
+                    if field_index < 0 or field_index >= n_fields:
+                        continue
+                    stats = &field_stats[field_index]
+                    cardinality = record.d.info[value_index].len
+                    stats.records += 1
+                    stats.total_values += cardinality
+                    if stats.records == 1 or cardinality < stats.min_cardinality:
+                        stats.min_cardinality = cardinality
+                    if stats.records == 1 or cardinality > stats.max_cardinality:
+                        stats.max_cardinality = cardinality
+                    field_type = bcf_hdr_id2type(scan_hdr, BCF_HL_INFO, field_index)
+                    tag = bcf_hdr_int2id(scan_hdr, BCF_DT_ID, field_index)
+                    if tag == NULL:
+                        continue
+                    if field_type == BCF_HT_STR:
+                        _schema_string_cardinality(
+                            stats, record.d.info[value_index].vptr, cardinality)
+                    elif field_type == BCF_HT_INT:
+                        n_values = bcf_get_info_values(
+                            scan_hdr, record, tag, <void **>&int_values,
+                            &int_capacity, BCF_HT_INT)
+                        if n_values < 0:
+                            raise IOError("unable to read INFO field values")
+                        for value_index in range(n_values):
+                            if int_values[value_index] == bcf_int32_missing or int_values[value_index] == bcf_int32_vector_end:
+                                continue
+                            numeric_value = int_values[value_index]
+                            if not stats.has_numeric:
+                                stats.min_value = numeric_value
+                                stats.max_value = numeric_value
+                                stats.has_numeric = True
+                            else:
+                                if numeric_value < stats.min_value:
+                                    stats.min_value = numeric_value
+                                if numeric_value > stats.max_value:
+                                    stats.max_value = numeric_value
+                    elif field_type == BCF_HT_REAL:
+                        n_values = bcf_get_info_values(
+                            scan_hdr, record, tag, <void **>&float_values,
+                            &float_capacity, BCF_HT_REAL)
+                        if n_values < 0:
+                            raise IOError("unable to read INFO field values")
+                        for value_index in range(n_values):
+                            if bcf_float_is_missing(float_values[value_index]) or bcf_float_is_vector_end(float_values[value_index]):
+                                continue
+                            numeric_value = float_values[value_index]
+                            if not stats.has_numeric:
+                                stats.min_value = numeric_value
+                                stats.max_value = numeric_value
+                                stats.has_numeric = True
+                            else:
+                                if numeric_value < stats.min_value:
+                                    stats.min_value = numeric_value
+                                if numeric_value > stats.max_value:
+                                    stats.max_value = numeric_value
+
+                for value_index in range(record.n_fmt):
+                    field_index = record.d.fmt[value_index].id
+                    if field_index < 0 or field_index >= n_fields:
+                        continue
+                    stats = &field_stats[n_fields + field_index]
+                    cardinality = record.d.fmt[value_index].n
+                    stats.records += 1
+                    stats.total_values += <uint64_t>cardinality * n_samples
+                    if stats.records == 1 or cardinality < stats.min_cardinality:
+                        stats.min_cardinality = cardinality
+                    if stats.records == 1 or cardinality > stats.max_cardinality:
+                        stats.max_cardinality = cardinality
+                    field_type = bcf_hdr_id2type(scan_hdr, BCF_HL_FMT, field_index)
+                    tag = bcf_hdr_int2id(scan_hdr, BCF_DT_ID, field_index)
+                    if tag == NULL or tag == b"GT":
+                        continue
+                    if field_type == BCF_HT_STR:
+                        string_format = &record.d.fmt[value_index]
+                        for sample_index in range(n_samples):
+                            _schema_string_cardinality(
+                                stats,
+                                string_format.p + <size_t>sample_index * string_format.size,
+                                string_format.size)
+                    elif field_type == BCF_HT_INT:
+                        n_values = bcf_get_format_values(
+                            scan_hdr, record, tag, <void **>&int_values,
+                            &int_capacity, BCF_HT_INT)
+                        if n_values < 0:
+                            raise IOError("unable to read FORMAT field values")
+                        for value_index in range(n_values):
+                            if int_values[value_index] == bcf_int32_missing or int_values[value_index] == bcf_int32_vector_end:
+                                continue
+                            numeric_value = int_values[value_index]
+                            if not stats.has_numeric:
+                                stats.min_value = numeric_value
+                                stats.max_value = numeric_value
+                                stats.has_numeric = True
+                            else:
+                                if numeric_value < stats.min_value:
+                                    stats.min_value = numeric_value
+                                if numeric_value > stats.max_value:
+                                    stats.max_value = numeric_value
+                    elif field_type == BCF_HT_REAL:
+                        n_values = bcf_get_format_values(
+                            scan_hdr, record, tag, <void **>&float_values,
+                            &float_capacity, BCF_HT_REAL)
+                        if n_values < 0:
+                            raise IOError("unable to read FORMAT field values")
+                        for value_index in range(n_values):
+                            if bcf_float_is_missing(float_values[value_index]) or bcf_float_is_vector_end(float_values[value_index]):
+                                continue
+                            numeric_value = float_values[value_index]
+                            if not stats.has_numeric:
+                                stats.min_value = numeric_value
+                                stats.max_value = numeric_value
+                                stats.has_numeric = True
+                            else:
+                                if numeric_value < stats.min_value:
+                                    stats.min_value = numeric_value
+                                if numeric_value > stats.max_value:
+                                    stats.max_value = numeric_value
+
+                n_genotypes = bcf_get_genotypes(
+                    scan_hdr, record, &genotypes, &genotype_capacity)
+                if n_genotypes > 0 and n_samples > 0:
+                    if n_genotypes % n_samples != 0:
+                        raise IOError("invalid genotype vector cardinality")
+                    stride = n_genotypes // n_samples
+                    if stride > ploidy_capacity:
+                        resized_counts = <uint64_t *>stdlib.realloc(
+                            ploidy_counts, <size_t>(stride + 1) * sizeof(uint64_t))
+                        if resized_counts == NULL:
+                            raise MemoryError()
+                        ploidy_counts = resized_counts
+                        for value_index in range(ploidy_capacity, stride + 1):
+                            ploidy_counts[value_index] = 0
+                        ploidy_capacity = stride
+                    for sample_index in range(n_samples):
+                        ploidy = 0
+                        for value_index in range(stride):
+                            allele_index = genotypes[sample_index * stride + value_index]
+                            if allele_index == bcf_int32_vector_end:
+                                break
+                            ploidy += 1
+                            if bcf_gt_is_missing(allele_index):
+                                missing_genotype_alleles += 1
+                                continue
+                            allele_index = bcf_gt_allele(allele_index)
+                            if allele_index < 0:
+                                missing_genotype_alleles += 1
+                                continue
+                            if allele_index >= allele_capacity:
+                                resized_counts = <uint64_t *>stdlib.realloc(
+                                    allele_counts, <size_t>(allele_index + 1) * sizeof(uint64_t))
+                                if resized_counts == NULL:
+                                    raise MemoryError()
+                                allele_counts = resized_counts
+                                for field_index in range(allele_capacity, allele_index + 1):
+                                    allele_counts[field_index] = 0
+                                allele_capacity = allele_index + 1
+                            allele_counts[allele_index] += 1
+                        if ploidy > ploidy_capacity:
+                            resized_counts = <uint64_t *>stdlib.realloc(
+                                ploidy_counts, <size_t>(ploidy + 1) * sizeof(uint64_t))
+                            if resized_counts == NULL:
+                                raise MemoryError()
+                            ploidy_counts = resized_counts
+                            for value_index in range(ploidy_capacity, ploidy + 1):
+                                ploidy_counts[value_index] = 0
+                            ploidy_capacity = ploidy
+                        ploidy_counts[ploidy] += 1
+
+            if chunked:
+                chunk_final_offset = bgzf_tell(chunk_fp)
+                if collect_chunk_index:
+                    if chunk_entry_count:
+                        chunk_payload = PyBytes_FromStringAndSize(
+                            <char *>chunk_entries,
+                            <Py_ssize_t>(chunk_entry_count * sizeof(SchemaIndexEntry)))
+                        chunk_index_stream.write(chunk_payload)
+                    chunk_index_stream.close()
+                    chunk_index_stream = None
+            if build_index:
+                final_offset = bgzf_tell(scan_hts.fp.bgzf)
+                if final_offset < 0 or hts_idx_finish(index, <uint64_t>final_offset) != 0:
+                    raise ValueError("unable to finish index; input may not be coordinate-sorted")
+                if scan_hts.format.format == vcf:
+                    index_metadata = _schema_vcf_index_metadata(
+                        index_contig_names)
+                    if hts_idx_set_meta(
+                            index, len(index_metadata),
+                            <uint8_t *>PyBytes_AS_STRING(index_metadata), 1) < 0:
+                        raise MemoryError("unable to set tabix index metadata")
+                _schema_save_index(index, self.fname, index_path_bytes, index_format)
+                index_available = True
+                index_created = True
+
+            fields = {"INFO": {}, "FORMAT": {}}
+            for is_info in (True, False):
+                for field_index in range(n_fields):
+                    stats = &field_stats[field_index if is_info else n_fields + field_index]
+                    tag = bcf_hdr_int2id(scan_hdr, BCF_DT_ID, field_index)
+                    if tag == NULL:
+                        continue
+                    field_name = from_bytes(tag)
+                    try:
+                        header_values = self.get_header_type(
+                            field_name,
+                            order=[BCF_HL_INFO if is_info else BCF_HL_FMT])
+                    except KeyError:
+                        continue
+                    numeric_bounds = None
+                    if stats.has_numeric:
+                        if header_values.get("Type") == "Integer":
+                            numeric_bounds = {
+                                "min": int(stats.min_value),
+                                "max": int(stats.max_value),
+                            }
+                        else:
+                            numeric_bounds = {
+                                "min": stats.min_value,
+                                "max": stats.max_value,
+                            }
+                    field_summary = {
+                        "type": header_values.get("Type"),
+                        "number": header_values.get("Number"),
+                        "records": int(stats.records),
+                        "total_values": int(stats.total_values),
+                        "cardinality_unit": "per_record" if is_info else "per_sample",
+                        "cardinality": {
+                            "min": stats.min_cardinality if stats.records else None,
+                            "max": stats.max_cardinality if stats.records else None,
+                        },
+                        "numeric_bounds": numeric_bounds,
+                    }
+                    if (header_values.get("Type") in ("String", "Character")
+                            and (is_info or field_name != "GT")):
+                        field_summary["logical_cardinality"] = {
+                            "min": stats.min_logical_cardinality if stats.has_logical_cardinality else None,
+                            "max": stats.max_logical_cardinality if stats.has_logical_cardinality else None,
+                        }
+                    fields["INFO" if is_info else "FORMAT"][field_name] = field_summary
+
+            allele_count_summary = {
+                "by_index": [int(allele_counts[value_index]) for value_index in range(allele_capacity)],
+                "missing": int(missing_genotype_alleles),
+            }
+            summary = {
+                "records": int(record_count),
+                "samples": n_samples,
+                "alleles_per_record": {
+                    value_index + 1: int(alleles_per_record[value_index])
+                    for value_index in range(alleles_per_record_capacity)
+                    if alleles_per_record[value_index] > 0
+                },
+                "allele_counts": allele_count_summary,
+                "ploidy": {
+                    value_index: int(ploidy_counts[value_index])
+                    for value_index in range(ploidy_capacity + 1)
+                    if ploidy_counts != NULL and ploidy_counts[value_index] > 0
+                },
+                "fields": fields,
+                "index": {
+                    "available": bool(index_available),
+                    "built": bool(index_created),
+                    "path": from_bytes(index_path_bytes) if index_path is not None else None,
+                },
+            }
+            if chunked:
+                summary["_final_offset"] = chunk_final_offset
+                summary["_actual_start"] = chunk_actual_start
+                summary["_next_start"] = record_offset
+                if collect_chunk_index:
+                    summary["_index_entries_path"] = _chunk_index_path
+            return summary
+        finally:
+            if record != NULL:
+                bcf_destroy(record)
+            if index != NULL:
+                hts_idx_destroy(index)
+            if existing_index != NULL:
+                hts_idx_destroy(existing_index)
+            if existing_tbx != NULL:
+                tbx_destroy(existing_tbx)
+            if scan_hdr != NULL:
+                bcf_hdr_destroy(scan_hdr)
+            if scan_hts != NULL:
+                hts_close(scan_hts)
+            if text_fp != NULL:
+                bgzf_close(text_fp)
+            stdlib.free(field_stats)
+            stdlib.free(genotypes)
+            stdlib.free(int_values)
+            stdlib.free(float_values)
+            stdlib.free(index_rid_map)
+            stdlib.free(allele_counts)
+            stdlib.free(alleles_per_record)
+            stdlib.free(ploidy_counts)
+            stdlib.free(chunk_entries)
+            ks_free(&chunk_line)
+            if chunk_index_stream is not None:
+                chunk_index_stream.close()
 
     def _bcf_region(VCF self, region):
         if self.hidx == NULL:
@@ -574,8 +2147,15 @@ cdef class VCF(HTSFile):
             yield from self._bcf_region(region)
             return
 
+        if self.hidx != NULL:
+            yield from self._bcf_region(region)
+            return
+
         if self.idx == NULL:
             self.idx = tbx_index_load(to_bytes(self.fname))
+            if self.idx == NULL:
+                csi_path = to_bytes(self.fname) + b".csi"
+                self.idx = tbx_index_load2(to_bytes(self.fname), csi_path)
             assert self.idx != NULL, "error loading tabix index for %s" % self.fname
 
         bregion = to_bytes(region)

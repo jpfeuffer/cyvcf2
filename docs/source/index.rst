@@ -61,6 +61,114 @@ See the :ref:`api` for detailed documentation, but the most common usage is summ
         # 2 samples of 0/0 and 1|1 would be [[0, 0, False], [1, 1, True]]
         print v.genotypes 
 
+Schema scanning and index creation
+==================================
+
+``VCF.schema_scan()`` reads the complete file through HTSlib and returns
+record, allele, genotype-ploidy, INFO, and FORMAT summaries without creating
+Python objects for individual records. It scans an independent input stream,
+so the reader's current iteration position is preserved.
+
+.. code-block:: python
+
+    vcf = VCF("variants.vcf.gz")
+    summary = vcf.schema_scan(threads=4)
+    summary["fields"]["INFO"]["DP"]["numeric_bounds"]
+
+Each header-declared field is included in ``fields``, even if it is absent
+from all records. Its summary includes VCF ``Type`` and ``Number``, the number
+of records containing the field, total value cardinality, minimum and maximum
+cardinality, and numeric bounds when available. INFO cardinality is per
+record; FORMAT cardinality is the encoded width per sample. GT ploidy is
+summarized separately. ``allele_counts["by_index"]`` contains called
+genotype-allele counts by zero-based VCF allele index, with missing genotype
+alleles reported separately.
+
+String and Character fields also include ``logical_cardinality`` with observed
+``min`` and ``max`` element counts: per record for INFO, per sample for FORMAT.
+This follows the VCF comma-separated value syntax, not the byte width or the
+header-declared ``Number``. For example, samples ``longword`` and ``x,y`` give
+logical cardinality ``{"min": 1, "max": 2}``, while their encoded FORMAT
+cardinality remains ``{"min": 9, "max": 9}``. Scalar strings count as one
+element; missing placeholders count as slots (``.`` is one, ``.,.`` is two).
+Absent fields have ``None`` extrema. These are not counts of nonmissing values.
+
+Delimiters are counted before percent decoding, so ``a%2Cb`` is one element,
+not two; UTF-8 multibyte characters do not change element counts. BCF string
+NUL terminators/padding are excluded. A zero-length encoded string has zero
+elements. GT uses its special allele-vector encoding and does not have
+``logical_cardinality``. Statistics are accumulated during the same native
+scan and merged across workers; no extra input pass or Python list allocation
+is needed. See the `VCF specification <https://samtools.github.io/hts-specs/VCFv4.3.pdf>`_
+for value delimiters and percent escaping.
+
+Pass ``index_path`` to reuse an existing index at that path or create one
+during the scan when it does not exist. Index creation supports CSI for VCF or
+BCF and TBI for BGZF-compressed VCF. It requires coordinate-sorted input.
+Without ``index_path``, an existing default index is detected but no index is
+created.
+
+Existing local indexes are read-only: an unreadable, truncated, incompatible,
+or detectably stale index raises an error rather than being ignored or rebuilt.
+To replace one, remove or rebuild it explicitly outside ``schema_scan``.
+New indexes are written to a temporary file and published without replacement;
+a destination created concurrently causes ``FileExistsError``. Index creation
+requires a local destination so that no-overwrite publication can be guaranteed.
+
+For a local BGZF-compressed VCF or BCF, pass ``workers`` to scan independent
+BGZF block ranges in parallel. Each worker returns compact summaries and, when an
+index is requested, streams its record offsets to a temporary file. The
+offsets are fed in input order to one in-memory HTSlib index builder; the
+finished CSI/TBI is written after all ranges are processed. ``threads``
+continues to control HTSlib decompression threads per scan.
+
+When an existing local CSI/TBI is available, its chunk start/end virtual
+offsets supply split hints, avoiding the BGZF block-discovery pass. The scanner
+still processes the entire header-to-EOF record stream, including variants
+spanning boundaries, exactly once; it does not concatenate coordinate-region
+queries. Boundary handoffs and index record counts (when present) are checked;
+failures raise an error, without falling back or changing the index. Sparse
+indexes may provide fewer useful splits than the requested worker count.
+Without an index the byte/block splitter remains available.
+
+CSI/TBI does not contain a source fingerprint. These checks detect some stale
+indexes but cannot certify all their coordinate-query metadata. Split hints
+never replace full-file parsing or determine which records are included.
+
+Use ``threads=0`` for automatic concurrency. For local files, the default is
+``max(1, available_cpus // 2)`` workers, each with one decompression thread
+alongside its parsing thread. CPU availability accounts for process affinity,
+Linux cgroup v1/v2 CPU quotas (including visible ancestor limits), and cpusets;
+fractional CPU quotas are rounded down, with a minimum of one CPU. HTSlib also
+creates an I/O helper thread, so this is a CPU-budget heuristic rather than a
+strict OS-thread limit. Uncompressed inputs need no decompression threads.
+With a one-CPU budget, decoding is synchronous. Remote inputs retain a single
+worker. Explicit ``workers`` overrides automatic selection, even if it exceeds
+the detected budget. Without ``threads=0``, the default remains a serial scan;
+positive ``threads`` values retain their per-worker decompression meaning.
+
+CSI indexes use HTSlib's format-specific depth selection from the declared
+contig lengths, with the same fallback when lengths are unknown. The smallest
+bins span 16,384 bases by default; exceptionally long contigs require larger
+bins. TBI retains its fixed 512 Mi-base coordinate limit per contig.
+
+BCF has no record sync marker, so each BCF worker locates its first record by
+validating the full binary structure of several consecutive records. Every
+located start is then checked against the exact offset where the previous
+worker stopped; a range whose start does not match is rescanned from the
+verified offset, so results never depend on the heuristic. VCF workers start at
+the first line in their range and use the same handoff check. Uncompressed
+VCF and BCF are split at arbitrary byte positions the same way; they cannot be
+indexed.
+
+.. code-block:: python
+
+    summary = vcf.schema_scan(
+        index_path="variants.vcf.gz.csi",
+        workers=4,
+        threads=1,
+    )
+
 Modifying Existing Records
 ==========================
 
