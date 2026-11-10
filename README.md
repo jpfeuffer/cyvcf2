@@ -22,6 +22,10 @@ Attributes like `variant.gt_ref_depths` work for diploid samples and return a nu
 **note** that the array is backed by the underlying C data, so, once `variant` goes out of scope. The array will contain nonsense.
 To persist a copy, use: `cpy = np.array(variant.gt_ref_depths)` instead of just `arr = variant.gt_ref_depths`.
 
+The opt-in [`variant.format_values("VS")`](docs/format-values.md) returns
+comma-separated String/Character FORMAT values as per-sample lists without
+changing `variant.format("VS")`.
+
 Example
 =======
 

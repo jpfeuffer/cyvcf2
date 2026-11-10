@@ -3082,6 +3082,41 @@ cdef class Variant(object):
                 keys.append(from_bytes(key))
             return keys
 
+    def format_values(self, field):
+        """Return comma-separated String/Character FORMAT values as sample lists.
+
+        Absent fields return None; a zero-sample reader returns an empty list.
+        Literal dots and percent escapes are preserved, not interpreted.
+        Unlike format(), no intermediate NumPy string array is constructed.
+        """
+        cdef bytes tag = to_bytes(field)
+        cdef bcf_fmt_t *fmt
+        cdef char *data
+        cdef int i, j, start
+        cdef list result = [], values
+        vtype = self.vcf.get_type(field)
+        if tag == b"GT" or vtype not in ("String", "Character"):
+            raise TypeError("format_values requires a String/Character FORMAT field other than GT")
+        if self.vcf.n_samples == 0:
+            return []
+        if bcf_unpack(self.b, 8) != 0:
+            raise ValueError("cannot unpack FORMAT values")
+        fmt = bcf_get_fmt(self.vcf.hdr, self.b, tag)
+        if fmt == NULL or fmt.p == NULL:
+            return None
+        for i in range(self.vcf.n_samples):
+            data = <char *>fmt.p + i * fmt.size
+            start = j = 0
+            values = []
+            while j < fmt.n and data[j] != 0:
+                if data[j] == ord(","):
+                    values.append(data[start:j].decode("utf-8"))
+                    start = j + 1
+                j += 1
+            values.append(data[start:j].decode("utf-8"))
+            result.append(values)
+        return result
+
     def format(self, field, vtype=None):
         """format returns a numpy array for the requested field.
 
