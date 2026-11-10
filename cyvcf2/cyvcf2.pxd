@@ -181,6 +181,8 @@ cdef extern from "htslib/vcf.h":
     ctypedef struct bcf_fmt_t:
         int id;
         int n; # n
+        int size;
+        uint8_t *p;
 
     ctypedef struct bcf_info_t:
         int key;        # key: numeric tag id, the corresponding string is bcf_hdr_t::id[BCF_DT_ID][$key].key

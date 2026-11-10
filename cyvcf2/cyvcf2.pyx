@@ -207,6 +207,28 @@ cdef struct SchemaFieldStats:
     bint has_numeric
     double min_value
     double max_value
+    bint has_logical_cardinality
+    int min_logical_cardinality
+    int max_logical_cardinality
+
+
+cdef void _schema_string_cardinality(
+        SchemaFieldStats *stats, const uint8_t *data, int length) noexcept:
+    cdef int i
+    cdef int count = 0
+    # Count delimiters before decoding percent escapes; stop at BCF NUL padding.
+    for i in range(length):
+        if data[i] == 0:
+            break
+        if i == 0:
+            count = 1
+        if data[i] == 44:
+            count += 1
+    if not stats.has_logical_cardinality or count < stats.min_logical_cardinality:
+        stats.min_logical_cardinality = count
+    if not stats.has_logical_cardinality or count > stats.max_logical_cardinality:
+        stats.max_logical_cardinality = count
+    stats.has_logical_cardinality = True
 
 
 cdef struct SchemaIndexEntry:
@@ -617,6 +639,8 @@ cdef class _SchemaIndexBuilder:
             str(index_path) if isinstance(index_path, Path) else index_path)
         if self.fname == self.index_path:
             raise ValueError("index_path must differ from the input path")
+        if b"://" in self.index_path:
+            raise ValueError("index creation requires a local destination for no-overwrite safety")
         self.index_format = (
             HTS_FMT_TBI if self.index_path.endswith(b".tbi") else HTS_FMT_CSI)
 
@@ -698,7 +722,6 @@ cdef class _SchemaIndexBuilder:
             source.close()
 
     def finish(self, int64_t final_offset):
-        cdef int ret
         cdef bytes metadata
 
         if self.finished:
@@ -712,10 +735,7 @@ cdef class _SchemaIndexBuilder:
                     self.index, len(metadata),
                     <uint8_t *>PyBytes_AS_STRING(metadata), 1) < 0:
                 raise MemoryError("unable to set tabix index metadata")
-        ret = hts_idx_save_as(
-            self.index, self.fname, self.index_path, self.index_format)
-        if ret < 0:
-            raise IOError("unable to save index to %s" % self.index_path)
+        _schema_save_index(self.index, self.fname, self.index_path, self.index_format)
         self.finished = True
 
     def __dealloc__(self):
@@ -821,6 +841,7 @@ def _schema_scan_worker(args):
 
 
 def _schema_index_is_available(path, index_path=None, is_bcf=False):
+    from ._schema_scan import _index_split_offsets
     cdef bytes fname = to_bytes(path)
     cdef bytes idxname
     cdef hts_idx_t *index = NULL
@@ -832,35 +853,75 @@ def _schema_index_is_available(path, index_path=None, is_bcf=False):
             str(index_path) if isinstance(index_path, Path) else index_path)
         if fname == idxname:
             raise ValueError("index_path must differ from the input path")
-        if not os.path.exists(index_path):
+        if not os.path.lexists(index_path):
             return False
-        if not is_bcf and idxname.endswith((b".tbi", b".csi")):
-            tbx = tbx_index_load2(fname, idxname)
-            if tbx != NULL:
-                tbx_destroy(tbx)
-                return True
-        else:
-            index = hts_idx_load2(fname, idxname)
-            if index != NULL:
-                hts_idx_destroy(index)
-                return True
-        raise OSError("unable to read existing index: %s" % index_path)
-
-    candidates = [fname + b".csi"] if is_bcf else [fname + b".csi", fname + b".tbi"]
+        candidates = [idxname]
+    else:
+        candidates = [fname + b".csi"] if is_bcf else [fname + b".csi", fname + b".tbi"]
     for idxname in candidates:
-        if not os.path.exists(idxname):
+        if not os.path.lexists(idxname):
             continue
         if not is_bcf:
             tbx = tbx_index_load2(fname, idxname)
             if tbx != NULL:
+                valid = (tbx.conf.preset == tbx_conf_vcf.preset and
+                         tbx.conf.sc == tbx_conf_vcf.sc and
+                         tbx.conf.bc == tbx_conf_vcf.bc and
+                         tbx.conf.ec == tbx_conf_vcf.ec)
                 tbx_destroy(tbx)
+                if not valid:
+                    raise OSError("existing index is not a VCF index")
+                _index_split_offsets(idxname, os.path.getsize(fname), 1, is_bcf)
                 return True
         else:
             index = hts_idx_load2(fname, idxname)
             if index != NULL:
                 hts_idx_destroy(index)
+                _index_split_offsets(idxname, os.path.getsize(fname), 1, is_bcf)
                 return True
+        raise OSError("unable to read existing index: %s" % os.fsdecode(idxname))
     return False
+
+
+cdef void _schema_save_index(
+        hts_idx_t *index, bytes fname, bytes destination, int index_format) except *:
+    if b"://" in destination:
+        raise ValueError("index creation requires a local destination for no-overwrite safety")
+    directory = os.path.dirname(os.path.abspath(destination))
+    with tempfile.TemporaryDirectory(prefix=b".cyvcf2-index-", dir=directory) as temporary:
+        staging = os.path.join(temporary, b"index")
+        if hts_idx_save_as(index, fname, staging, index_format) < 0:
+            raise IOError("unable to save index to %s" % os.fsdecode(destination))
+        # Linking is atomic and fails if another writer created the destination.
+        os.link(staging, destination)
+
+
+def _schema_index_ranges(path, index_path, int workers):
+    cdef htsFile *fp = NULL
+    cdef bcf_hdr_t *hdr = NULL
+    cdef int64_t header_end
+    cdef bytes fname = to_bytes(path)
+    from ._schema_scan import _index_split_offsets
+    fp = hts_open(fname, b"r")
+    if fp == NULL:
+        raise IOError("unable to open input for indexed splitting")
+    try:
+        if not fp.is_bgzf or fp.format.compression == no_compression:
+            raise ValueError("indexed splitting requires BGZF-compressed VCF/BCF")
+        hdr = bcf_hdr_read(fp)
+        if hdr == NULL:
+            raise IOError("cannot parse VCF/BCF header")
+        boundaries, records = _index_split_offsets(
+            index_path, os.path.getsize(path), workers, fp.format.format == bcf)
+        header_end = bgzf_tell(fp.fp.bgzf)
+    finally:
+        if hdr != NULL:
+            bcf_hdr_destroy(hdr)
+        hts_close(fp)
+    boundaries = [offset for offset in boundaries if offset > header_end]
+    starts = [-1] + boundaries
+    ends = boundaries + [(1 << 63) - 1]
+    return [(start, end, start) for start, end in zip(starts, ends)], records
 
 
 def _merge_schema_scan_summaries(summaries):
@@ -892,6 +953,16 @@ def _merge_schema_scan_summaries(summaries):
                     target["cardinality"]["max"] = (
                         field["cardinality"]["max"] if current_max is None
                         else max(current_max, field["cardinality"]["max"]))
+                if "logical_cardinality" in field:
+                    logical = field["logical_cardinality"]
+                    if logical["min"] is not None:
+                        current = target["logical_cardinality"]
+                        current["min"] = (
+                            logical["min"] if current["min"] is None
+                            else min(current["min"], logical["min"]))
+                        current["max"] = (
+                            logical["max"] if current["max"] is None
+                            else max(current["max"], logical["max"]))
                 bounds = field["numeric_bounds"]
                 if bounds is not None:
                     current = target["numeric_bounds"]
@@ -1205,6 +1276,9 @@ cdef class VCF(HTSFile):
         where an index will be built during this scan if it does not exist.
         No index is created when ``index_path`` is ``None``. Index creation
         requires a BGZF-compressed, coordinate-sorted input file.
+        Existing indexes are never overwritten. Unreadable or invalid local
+        indexes raise an error. Newly built indexes require a local destination
+        and fail if that destination is created concurrently.
         ``threads=0`` opts into automatic concurrency: half the available CPU
         budget (honoring affinity and Linux cgroups) is used for workers,
         each with one decompression thread. A one-CPU budget decodes
@@ -1213,6 +1287,13 @@ cdef class VCF(HTSFile):
         the number of HTSlib decompression threads per worker.
         ``workers`` parallelizes local BGZF-compressed or uncompressed VCF/BCF
         scans across independent file ranges (indexing requires BGZF).
+        An existing local CSI/TBI supplies record-offset split hints instead
+        of BGZF block discovery. All records are still scanned; split boundaries
+        and available index record counts are checked. Sparse indexes may yield
+        fewer workers. Without an index the existing byte/block splitter is used.
+        String and Character field summaries also contain ``logical_cardinality``
+        (comma-separated element counts, excluding NUL padding). GT is excluded;
+        its allele-vector cardinality and actual ploidy are reported separately.
         VCF workers start at the first line in their range; BCF workers locate
         their first record by
         structural validation; every range start is verified against the
@@ -1280,6 +1361,7 @@ cdef class VCF(HTSFile):
         cdef bint is_info
         cdef double numeric_value
         cdef SchemaFieldStats *stats
+        cdef bcf_fmt_t *string_format
         cdef kstring_t chunk_line
         cdef BGZF *chunk_fp = NULL
         cdef BGZF *text_fp = NULL
@@ -1330,8 +1412,20 @@ cdef class VCF(HTSFile):
                 self.fname, index_path, is_bcf)
             build_index = index_path is not None and not index_available
             source_path = os.fsdecode(self.fname)
-            ranges = _schema_bgzf_ranges(
-                source_path, workers)
+            split_index = None
+            expected_records = None
+            if index_available:
+                split_index = index_path
+                if split_index is None:
+                    split_index = next(
+                        candidate for candidate in
+                        ([self.fname + b".csi"] if is_bcf else
+                         [self.fname + b".csi", self.fname + b".tbi"])
+                        if os.path.lexists(candidate))
+                ranges, expected_records = _schema_index_ranges(
+                    source_path, split_index, workers)
+            else:
+                ranges = _schema_bgzf_ranges(source_path, workers)
             if is_bcf:
                 ranges = [(start, end, start) for start, end, _ in ranges]
             from concurrent.futures import ProcessPoolExecutor
@@ -1345,7 +1439,7 @@ cdef class VCF(HTSFile):
                         build_index,
                         os.path.join(workdir, "chunk-%d.idx" % i)
                         if build_index else None,
-                        False,
+                        split_index is not None,
                     )
                     for i, (start, end, seek) in enumerate(ranges)
                 ]
@@ -1365,6 +1459,8 @@ cdef class VCF(HTSFile):
                         chunk_summary = future.result()
                         if (i > 0 and
                                 chunk_summary["_actual_start"] != expected_start):
+                            if split_index is not None:
+                                raise OSError("index split does not match a record boundary")
                             # The located start disagrees with where the
                             # previous range ended; rescan from the verified offset.
                             task = list(tasks[i])
@@ -1383,6 +1479,8 @@ cdef class VCF(HTSFile):
                 if build_index:
                     builder.finish(final_offset)
             summary = _merge_schema_scan_summaries(chunk_summaries)
+            if expected_records is not None and summary["records"] != expected_records:
+                raise OSError("index record count does not match the input")
             if build_index:
                 index_available = True
                 index_created = True
@@ -1400,6 +1498,9 @@ cdef class VCF(HTSFile):
         if self.fname is None:
             raise ValueError("schema_scan requires a VCF/BCF filename")
 
+        if b"://" not in self.fname:
+            _schema_index_is_available(
+                self.fname, index_path, self.hts.format.format == bcf)
         scan_hts = hts_open(self.fname, b"r")
         if scan_hts == NULL:
             raise IOError("Error opening %s" % self.fname)
@@ -1489,7 +1590,7 @@ cdef class VCF(HTSFile):
                     raise ValueError("index_path must differ from the input path")
                 if index_path_bytes.endswith(b".tbi"):
                     index_format = HTS_FMT_TBI
-                local_index_exists = os.path.exists(index_path)
+                local_index_exists = os.path.lexists(index_path)
                 if local_index_exists or b"://" in index_path_bytes:
                     existing_index = hts_idx_load2(self.fname, index_path_bytes)
                     if existing_index != NULL:
@@ -1525,6 +1626,8 @@ cdef class VCF(HTSFile):
                         existing_tbx = NULL
 
             if build_index:
+                if b"://" in index_path_bytes:
+                    raise ValueError("index creation requires a local destination for no-overwrite safety")
                 if not scan_hts.is_bgzf or scan_hts.format.compression == no_compression:
                     raise ValueError("index creation requires BGZF-compressed VCF/BCF")
                 if index_format == HTS_FMT_TBI and scan_hts.format.format != vcf:
@@ -1656,7 +1759,10 @@ cdef class VCF(HTSFile):
                     tag = bcf_hdr_int2id(scan_hdr, BCF_DT_ID, field_index)
                     if tag == NULL:
                         continue
-                    if field_type == BCF_HT_INT:
+                    if field_type == BCF_HT_STR:
+                        _schema_string_cardinality(
+                            stats, record.d.info[value_index].vptr, cardinality)
+                    elif field_type == BCF_HT_INT:
                         n_values = bcf_get_info_values(
                             scan_hdr, record, tag, <void **>&int_values,
                             &int_capacity, BCF_HT_INT)
@@ -1711,7 +1817,14 @@ cdef class VCF(HTSFile):
                     tag = bcf_hdr_int2id(scan_hdr, BCF_DT_ID, field_index)
                     if tag == NULL or tag == b"GT":
                         continue
-                    if field_type == BCF_HT_INT:
+                    if field_type == BCF_HT_STR:
+                        string_format = &record.d.fmt[value_index]
+                        for sample_index in range(n_samples):
+                            _schema_string_cardinality(
+                                stats,
+                                string_format.p + <size_t>sample_index * string_format.size,
+                                string_format.size)
+                    elif field_type == BCF_HT_INT:
                         n_values = bcf_get_format_values(
                             scan_hdr, record, tag, <void **>&int_values,
                             &int_capacity, BCF_HT_INT)
@@ -1821,10 +1934,7 @@ cdef class VCF(HTSFile):
                             index, len(index_metadata),
                             <uint8_t *>PyBytes_AS_STRING(index_metadata), 1) < 0:
                         raise MemoryError("unable to set tabix index metadata")
-                index_status = hts_idx_save_as(
-                    index, self.fname, index_path_bytes, index_format)
-                if index_status < 0:
-                    raise IOError("unable to save index to %s" % index_path)
+                _schema_save_index(index, self.fname, index_path_bytes, index_format)
                 index_available = True
                 index_created = True
 
@@ -1866,6 +1976,12 @@ cdef class VCF(HTSFile):
                         },
                         "numeric_bounds": numeric_bounds,
                     }
+                    if (header_values.get("Type") in ("String", "Character")
+                            and (is_info or field_name != "GT")):
+                        field_summary["logical_cardinality"] = {
+                            "min": stats.min_logical_cardinality if stats.has_logical_cardinality else None,
+                            "max": stats.max_logical_cardinality if stats.has_logical_cardinality else None,
+                        }
                     fields["INFO" if is_info else "FORMAT"][field_name] = field_summary
 
             allele_count_summary = {

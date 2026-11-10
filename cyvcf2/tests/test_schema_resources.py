@@ -6,6 +6,35 @@ import pytest
 from cyvcf2 import _schema_scan as resources
 
 
+def test_index_split_offsets_and_metadata(tmp_path):
+    import struct
+    path = tmp_path / "index.csi"
+    metadata_bin = ((1 << 18) - 1) // 7 + 1
+    chunks = [(10 << 16, 20 << 16), (30 << 16, 40 << 16)]
+    data = struct.pack("<4siiii", b"CSI\x01", 14, 5, 0, 1)
+    data += struct.pack("<iIQi", 2, 4681, 10 << 16, 2)
+    data += b"".join(struct.pack("<QQ", *chunk) for chunk in chunks)
+    data += struct.pack("<IQiQQQQQ", metadata_bin, 0, 2,
+                        10 << 16, 40 << 16, 4, 0, 0)
+    path.write_bytes(data)
+    boundaries, count = resources._index_split_offsets(path, 50, 4)
+    assert boundaries == [10 << 16, 20 << 16, 30 << 16]
+    assert count == 4
+    path.write_bytes(data[:-10])
+    with pytest.raises(OSError, match="index"):
+        resources._index_split_offsets(path, 50, 4)
+
+
+def test_index_split_offsets_rejects_out_of_bounds(tmp_path):
+    import struct
+    path = tmp_path / "index.csi"
+    path.write_bytes(
+        struct.pack("<4siiii", b"CSI\x01", 14, 5, 0, 1)
+        + struct.pack("<iIQiQQ", 1, 4681, 0, 1, 10 << 16, 60 << 16))
+    with pytest.raises(OSError, match="chunk offsets"):
+        resources._index_split_offsets(path, 50, 4)
+
+
 @pytest.mark.parametrize("value,expected", [
     ("0", {0}),
     ("0-2,5,8-9", {0, 1, 2, 5, 8, 9}),

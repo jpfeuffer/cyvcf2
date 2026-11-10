@@ -1,4 +1,6 @@
 # v0.34.0
++ report logical comma-separated INFO/FORMAT String and Character cardinalities during schema scans
++ reuse existing CSI/TBI offsets for parallel schema scans and refuse index overwrites
 + drop support for end-of-life Python 3.8 (minimum is now 3.9)
 + add PyPI trove classifiers (Python 3.9–3.14)
 + bump cibuildwheel to v4 and drop the stale prerelease-pythons flag
