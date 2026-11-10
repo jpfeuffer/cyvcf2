@@ -55,6 +55,10 @@ Docker host alone does not establish that the wheel targets x86_64.
 dependencies. Mount only the final sdist, ``ci/`` scripts, and an output folder
 into the local container, then run ``ci/build-internal-linux``. No repository
 source is uploaded to a remote builder.
+The pinned image's system GCC 8 is selected explicitly: GCC 14 treats an
+incompatible-pointer warning in NumPy 2.0.0's own ``dtype_api.h`` as an error
+under the Limited API. This keeps the minimum NumPy build/runtime floor intact
+without disabling diagnostics in project code or modifying NumPy headers.
 If corporate HTTPS requires existing local public CA certificates, pass their
 bundle as the optional BuildKit secret ``trusted_ca``. Mount that same public
 bundle and set ``SSL_CERT_FILE`` for container package downloads. Never disable

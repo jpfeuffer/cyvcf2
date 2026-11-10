@@ -17,6 +17,7 @@ export CYVCF2_HTSLIB_MODE=BUILTIN
 export CYVCF2_CYTHONIZE=ON
 export CYVCF2_HTSLIB_CONFIGURE_OPTIONS="--enable-libcurl --enable-s3 --enable-lzma --enable-bz2 --with-libdeflate"
 export CMAKE_BUILD_PARALLEL_LEVEL=2
+export CC=/usr/bin/gcc
 uv build --python /opt/python/cp312-cp312/bin/python \
     --build-constraints "$ci/internal-build-constraints.txt" \
     --wheel --out-dir "$output/unrepaired" "$sdist"
