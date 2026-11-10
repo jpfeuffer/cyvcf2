@@ -1,0 +1,23 @@
+version = "0.35.0+pfizer.1"
+tag = "pfizer/cyvcf2/0.35.0+pfizer.1"
+upstream_base = "08c81f1062de132e3c1d1456bda57ed55e2e408a"
+integration_merge = "ecdb5d528ffb847e921c94d4ceae8e87fd67f246"
+htslib = "8f7231035d0409d525767c66d9f49f1f967ee1df"
+htscodecs = "ffda7310c4b3292955561d6c3b1743cb82bfe26b"
+
+[units.schema_index]
+branch = "jpfeuffer-schema-scan-index"
+tip = "3795758026e410407a1c196d8ffbbafd68ddc73b"
+
+[units.genotype_phasing]
+branch = "jpfeuffer-fix-latest-htslib-build"
+tip = "ab7d0b1b0e5658e47ba92928a7b2cdaf9da6eb2d"
+
+[units.format_values]
+branch = "jpfeuffer-standalone-format-values"
+tip = "9b7febc35d8822db53cf76bacbe0e5651e89a57e"
+
+[units.native_batch]
+branch = "jpfeuffer-standalone-native-batch"
+tip = "0344e0e399f624907f14fe9664b1f81f2feedf6e"
+extracted_source = "41433ed5350b4230703569b001397f2df64987e3"

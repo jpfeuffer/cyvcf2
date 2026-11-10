@@ -271,3 +271,4 @@ Pysam also `has a cython wrapper to htslib <https://github.com/pysam-developers/
 
    docstrings
    writing
+   internal-release

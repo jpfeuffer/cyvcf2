@@ -1,0 +1,88 @@
+#!/bin/bash
+set -euo pipefail
+
+if [[ $# != 2 ]]; then
+    echo "Usage: bash ci/build-internal-release PYTHON OUTPUT_DIRECTORY" >&2
+    exit 2
+fi
+
+case "$(uname -sm)" in
+    "Darwin arm64")
+        command -v delocate-wheel >/dev/null
+        ;;
+    "Linux x86_64")
+        command -v auditwheel >/dev/null
+        ;;
+    *)
+        echo "Build on macOS arm64 or inside a Linux x86_64 manylinux container." >&2
+        exit 1
+        ;;
+esac
+
+cd "$(git rev-parse --show-toplevel)"
+if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+    echo "Release builds require a clean checkout." >&2
+    exit 1
+fi
+if git submodule status --recursive | grep -Eq '^[-+U]'; then
+    echo "Initialize submodules at their recorded commits before building." >&2
+    exit 1
+fi
+if [[ -e "$2" ]]; then
+    echo "Output directory must not already exist: $2" >&2
+    exit 1
+fi
+if [[ ! -f ci/internal-release.toml ]]; then
+    echo "Missing exact-unit release manifest." >&2
+    exit 1
+fi
+
+python="$1"
+mkdir -p "$2"
+output="$(cd "$2" && pwd)"
+export SOURCE_DATE_EPOCH
+SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+export CYVCF2_HTSLIB_MODE=BUILTIN
+export CYVCF2_CYTHONIZE=ON
+export CYVCF2_HTSLIB_CONFIGURE_OPTIONS="--enable-libcurl --enable-s3 --enable-lzma --enable-bz2 --with-libdeflate"
+export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
+
+uv build --python "$python" --build-constraints ci/internal-build-constraints.txt --sdist --out-dir "$output/source"
+sdists=("$output"/source/*.tar.gz)
+[[ ${#sdists[@]} == 1 && -f "${sdists[0]}" ]]
+uv build --python "$python" --build-constraints ci/internal-build-constraints.txt --wheel --out-dir "$output/unrepaired" "${sdists[0]}"
+wheels=("$output"/unrepaired/*.whl)
+[[ ${#wheels[@]} == 1 && -f "${wheels[0]}" ]]
+mkdir "$output/artifacts"
+cp "${sdists[0]}" "$output/artifacts/"
+
+case "$(uname -s)" in
+    Darwin)
+        delocate-wheel --require-archs "$(uname -m)" -w "$output/artifacts" "${wheels[0]}"
+        ;;
+    Linux)
+        auditwheel repair --plat manylinux_2_28_x86_64 -w "$output/artifacts" "${wheels[0]}"
+        ;;
+    *)
+        echo "Unsupported local release platform." >&2
+        exit 1
+        ;;
+esac
+
+cp ci/internal-release.toml "$output/"
+{
+    git rev-parse HEAD
+    git submodule status --recursive
+    uv --version
+    "$python" --version
+    uname -sm
+    printf 'SOURCE_DATE_EPOCH=%s\n' "$SOURCE_DATE_EPOCH"
+} > "$output/build-info.txt"
+(
+    cd "$output/artifacts"
+    if command -v sha256sum >/dev/null; then
+        sha256sum ./*.whl ./*.tar.gz
+    else
+        shasum -a 256 ./*.whl ./*.tar.gz
+    fi
+) > "$output/SHA256SUMS"
