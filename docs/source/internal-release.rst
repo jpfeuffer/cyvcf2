@@ -19,8 +19,9 @@ This private release targets ordinary GIL-enabled CPython 3.12 and newer using
 ``cp312-abi3`` wheels, not free-threaded ``abi3t``. The C extension is compiled
 with ``Py_LIMITED_API`` through CMake's ``USE_SABI`` support, not merely
 renamed. The release gate covers CPython 3.12, 3.13, and 3.14 on both platforms.
-Build constraints use NumPy 2.0.0 headers and retain the runtime ``numpy>=2.0.0``
-requirement. Test the exact minimum NumPy on Python 3.12 and compatible newer
+Build constraints use NumPy 2.5.4 headers with
+``NPY_TARGET_VERSION=NPY_2_0_API_VERSION`` and retain the runtime
+``numpy>=2.0.0`` requirement. Test the exact minimum NumPy on Python 3.12 and compatible newer
 NumPy wheels on the other interpreters; do not silently raise the runtime floor.
 
 Initialize submodules recursively and use a clean committed checkout. Install
@@ -55,10 +56,11 @@ Docker host alone does not establish that the wheel targets x86_64.
 dependencies. Mount only the final sdist, ``ci/`` scripts, and an output folder
 into the local container, then run ``ci/build-internal-linux``. No repository
 source is uploaded to a remote builder.
-The pinned image's system GCC 8 is selected explicitly: GCC 14 treats an
-incompatible-pointer warning in NumPy 2.0.0's own ``dtype_api.h`` as an error
-under the Limited API. This keeps the minimum NumPy build/runtime floor intact
-without disabling diagnostics in project code or modifying NumPy headers.
+The pinned image's GCC 14 treats an incompatible-pointer warning in NumPy
+2.0.0's own ``dtype_api.h`` as an error under the Limited API; its system GCC 8
+also rejects an incomplete-type expression in the old headers. Newer build
+headers targeting the NumPy 2.0 API avoid these compiler issues without
+disabling diagnostics, modifying headers, or raising the runtime floor.
 If corporate HTTPS requires existing local public CA certificates, pass their
 bundle as the optional BuildKit secret ``trusted_ca``. Mount that same public
 bundle and set ``SSL_CERT_FILE`` for container package downloads. Never disable
