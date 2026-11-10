@@ -821,13 +821,14 @@ cdef class VCF(HTSFile):
         """Experimental sequential native columns; see docs/native-batches.md."""
         cdef list specs = []
         cdef _BatchField field
-        cdef _BatchBuffer buf, positions = _BatchBuffer(), rids = _BatchBuffer()
+        cdef _BatchBuffer positions = _BatchBuffer(), rids = _BatchBuffer()
         cdef _BatchBuffer lengths = _BatchBuffer(), quals = _BatchBuffer()
         cdef _BatchBuffer strings = _BatchBuffer(), string_offsets = _BatchBuffer()
         cdef bcf1_t *record = NULL
-        cdef int ret, err, width, i
+        cdef int ret, err, i
+        cdef int32_t width
         cdef bint ready = False
-        cdef int64_t offset = 0, pos
+        cdef int64_t offset = 0, pos, length
         cdef Py_ssize_t rows = 0, used, needed, string_size
         cdef bytes text
         if self.hts == NULL:
@@ -915,9 +916,10 @@ cdef class VCF(HTSFile):
                         raise ValueError("single record exceeds max_bytes; retry with a larger cap or next(reader)")
                     break
                 pos = record.pos + 1
+                length = record.rlen
                 positions.append(&pos, 8)
                 rids.append(&record.rid, 4)
-                lengths.append(&record.rlen, 8)
+                lengths.append(&length, 8)
                 quals.append(&record.qual, 4)
                 strings.append(<const char *>text, string_size)
                 offset = strings.size
@@ -1706,6 +1708,41 @@ cdef class Variant(object):
                 key = bcf_hdr_int2id(self.vcf.hdr, BCF_DT_ID, fmt.id)
                 keys.append(from_bytes(key))
             return keys
+
+    def format_values(self, field):
+        """Return comma-separated String/Character FORMAT values as sample lists.
+
+        Absent fields return None; a zero-sample reader returns an empty list.
+        Literal dots and percent escapes are preserved, not interpreted.
+        Unlike format(), no intermediate NumPy string array is constructed.
+        """
+        cdef bytes tag = to_bytes(field)
+        cdef bcf_fmt_t *fmt
+        cdef char *data
+        cdef int i, j, start
+        cdef list result = [], values
+        vtype = self.vcf.get_type(field)
+        if tag == b"GT" or vtype not in ("String", "Character"):
+            raise TypeError("format_values requires a String/Character FORMAT field other than GT")
+        if self.vcf.n_samples == 0:
+            return []
+        if bcf_unpack(self.b, 8) != 0:
+            raise ValueError("cannot unpack FORMAT values")
+        fmt = bcf_get_fmt(self.vcf.hdr, self.b, tag)
+        if fmt == NULL or fmt.p == NULL:
+            return None
+        for i in range(self.vcf.n_samples):
+            data = <char *>fmt.p + i * fmt.size
+            start = j = 0
+            values = []
+            while j < fmt.n and data[j] != 0:
+                if data[j] == ord(","):
+                    values.append(data[start:j].decode("utf-8"))
+                    start = j + 1
+                j += 1
+            values.append(data[start:j].decode("utf-8"))
+            result.append(values)
+        return result
 
     def format(self, field, vtype=None):
         """format returns a numpy array for the requested field.

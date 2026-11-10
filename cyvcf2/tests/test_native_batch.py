@@ -133,6 +133,9 @@ def test_equivalence(source, tmp_path, encoding, samples):
                             assert len(actual) == 0
                         else:
                             np.testing.assert_array_equal(actual.reshape(value.shape), value)
+                            if actual.dtype == np.float32:
+                                np.testing.assert_array_equal(
+                                    actual.view("u4"), value.ravel().view("u4"))
                     else:
                         value = variant.INFO.get(tag)
                         if value is None:
@@ -221,6 +224,37 @@ def test_raw_gt_encoded_truth(source):
             actual[::width] &= ~1
         assert actual.tolist() == raw
     assert batch["fields"]["FORMAT/GT"]["widths"].tolist() == [3, 3, -1, 2]
+
+
+@pytest.mark.parametrize("max_rows", [1, 2, 1000])
+@pytest.mark.parametrize("max_bytes", [128, 256, 1024])
+def test_repeated_byte_caps_are_lossless(source, max_rows, max_bytes):
+    with VCF(source) as reader:
+        positions = []
+        while True:
+            cap = max_bytes
+            try:
+                batch = reader.read_batch(max_rows=max_rows, max_bytes=max_bytes)
+            except ValueError as error:
+                assert "single record" in str(error)
+                batch = reader.read_batch(max_rows=1, max_bytes=1024)
+                cap = 1024
+            assert batch["num_rows"] <= max_rows
+            assert batch["nbytes"] <= cap
+            if not batch["num_rows"]:
+                break
+            positions.extend(batch["POS"].tolist())
+    assert positions == [10, 10, 20, 30]
+
+
+def test_float_nan_bits_and_vector_end(source):
+    with VCF(source) as reader:
+        batch = reader.read_batch(("FORMAT/FA", "INFO/FF"), max_rows=1)
+    assert batch["fields"]["FORMAT/FA"]["values"].view("u4").tolist() == [
+        0x3F800000, 0x7F800001, 0x7F800001, 0x7F800002, 0x40000000, 0x40400000]
+    bits = batch["fields"]["INFO/FF"]["values"].view("u4")
+    assert bits[0] == 0x7F800001
+    assert bits[1] != bits[0] and np.isnan(bits[1:].view("f4")[0])
 
 
 @pytest.mark.parametrize("kwargs,exception", [

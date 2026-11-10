@@ -25,6 +25,9 @@ To persist a copy, use: `cpy = np.array(variant.gt_ref_depths)` instead of just 
 This fork also provides an opt-in experimental
 [`VCF.read_batch` columnar reader](docs/native-batches.md) with owned arrays,
 requested numeric fields, and explicit row/output-byte limits.
+The separate opt-in [`variant.format_values("VS")`](docs/native-batches.md#opt-in-stringcharacter-format-lists)
+returns comma-separated String/Character FORMAT values as per-sample lists
+without changing `variant.format("VS")`.
 
 Example
 =======
