@@ -239,6 +239,9 @@ set_target_properties(cyvcf2_extension PROPERTIES
 target_compile_definitions(cyvcf2_extension PRIVATE
   NPY_TARGET_VERSION=NPY_2_0_API_VERSION
 )
+if(CYVCF2_HTSLIB_MODE STREQUAL "BUILTIN")
+  target_compile_definitions(cyvcf2_extension PRIVATE CYVCF2_BUNDLED_HTSLIB=1)
+endif()
 
 target_include_directories(cyvcf2_extension PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/cyvcf2"

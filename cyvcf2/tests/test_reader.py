@@ -1746,9 +1746,13 @@ def test_build_index_unsorted(tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["empty", "tabix_only", "wrong_format", "truncated"])
-def test_build_index_tabix_semantics(tmp_path, kind):
+@pytest.mark.parametrize("workers", [1, 2])
+def test_build_index_tabix_semantics(tmp_path, kind, workers):
     import struct
     from cyvcf2 import build_index
+    import cyvcf2.cyvcf2 as native
+    if workers > 1 and not native._coordinate_workers_available:
+        pytest.skip("coordinate workers require bundled HTSlib")
     header = (
         '##fileformat=VCFv4.3\n'
         '##contig=<ID=1,length=1000>\n'
@@ -1777,16 +1781,168 @@ def test_build_index_tabix_semantics(tmp_path, kind):
     destination = tmp_path / "output.csi"
     if kind in ("wrong_format", "truncated"):
         with pytest.raises((OSError, ValueError)):
-            build_index(path, destination)
+            build_index(path, destination, workers=workers)
         assert not destination.exists()
     else:
-        build_index(path, destination, threads=2)
+        build_index(path, destination, threads=2, workers=workers)
         with VCF(str(path), samples=[]) as reader:
             reader.set_index(str(destination))
             assert reader.num_records == (0 if kind == "empty" else 2)
             if kind == "tabix_only":
                 assert next(reader("1:50-50")).POS == 1
                 assert next(reader("1:200-200")).POS == 200
+    assert not list(tmp_path.glob(".cyvcf2-index-*"))
+
+
+def _write_index_test_bgzf(path, data):
+    import struct
+    with path.open("wb") as stream:
+        for start in range(0, len(data), 32000):
+            compressed = gzip.compress(data[start:start + 32000], mtime=0)
+            stream.write(
+                compressed[:3] + b"\x04" + compressed[4:10]
+                + b"\x06\x00BC\x02\x00" + struct.pack("<H", len(compressed) + 7)
+                + compressed[10:]
+            )
+        stream.write(bytes.fromhex("1f8b08040000000000ff0600424302001b0003000000000000000000"))
+
+
+@pytest.fixture
+def coordinate_vcf(tmp_path, monkeypatch):
+    import cyvcf2.cyvcf2 as native
+    from cyvcf2 import _index
+    if not native._coordinate_workers_available:
+        pytest.skip("coordinate workers require bundled HTSlib")
+    monkeypatch.setattr(_index, "_COMPRESSED_CHUNK_BYTES", 512)
+    header = (
+        '##fileformat=VCFv4.3\n'
+        '##contig=<ID=1,length=10000>\n'
+        '##INFO=<ID=END,Number=1,Type=Integer,Description="End">\n'
+        '##INFO=<ID=PAD,Number=1,Type=String,Description="Padding">\n'
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="GT">\n'
+        '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n'
+    )
+    rows = []
+    for chrom in ("1", "undeclared"):
+        for i in range(1, 401):
+            alt = "<DEL>" if i % 47 == 0 else ("<NON_REF>" if i % 31 == 0 else "C")
+            padding = "a" * (300000 if i == 150 else 1024)
+            rows.append(
+                f"{chrom}\t{i}\tr{i}\tA\t{alt}\t.\tPASS\tEND={i + 90};PAD={padding}\tGT\tinvalid\n"
+            )
+    data = (header + "".join(rows)).encode()
+    path = tmp_path / "coordinate.vcf.gz"
+    _write_index_test_bgzf(path, data)
+    return path
+
+
+@pytest.mark.parametrize("workers,threads", [(2, 0), (4, 1), (8, 0)])
+@pytest.mark.parametrize("suffix", ["csi", "tbi"])
+def test_build_index_parallel_boundaries(coordinate_vcf, tmp_path, workers, threads, suffix):
+    from cyvcf2 import build_index
+    from cyvcf2 import _index
+    import cyvcf2.cyvcf2 as native
+    reference = tmp_path / ("serial." + suffix)
+    destination = tmp_path / ("parallel." + suffix)
+    build_index(coordinate_vcf, reference)
+    builder = native._CoordinateIndexBuilder(os.fsencode(coordinate_vcf), os.fsencode(destination))
+    ranges = list(_index._ranges(os.fsencode(coordinate_vcf), builder.offset0))
+    assert len(ranges) > workers
+    assert all(left[1] == right[0] for left, right in zip(ranges, ranges[1:]))
+    build_index(coordinate_vcf, destination, workers=workers, threads=threads)
+    assert gzip.decompress(destination.read_bytes()) == gzip.decompress(reference.read_bytes())
+    with VCF(str(coordinate_vcf), samples=[]) as serial, VCF(str(coordinate_vcf), samples=[]) as parallel:
+        serial.set_index(str(reference))
+        parallel.set_index(str(destination))
+        assert serial.num_records == parallel.num_records == 800
+        for chrom in ("1", "undeclared"):
+            for begin, end in [(1, 490), (1, 1), (150, 150), (400, 490), (500, 600)] + [
+                (position, position + 5) for position in range(20, 400, 17)
+            ]:
+                region = "%s:%d-%d" % (chrom, begin, end)
+                expected = [(v.CHROM, v.POS, v.end, v.ID, v.ALT) for v in serial(region)]
+                assert [(v.CHROM, v.POS, v.end, v.ID, v.ALT) for v in parallel(region)] == expected
+
+
+def test_build_index_parallel_rejects_bad_handoff(coordinate_vcf, tmp_path, monkeypatch):
+    from cyvcf2 import build_index, _index
+    original = _index._ranges
+
+    def damaged_ranges(path, start):
+        for begin, end in original(path, start):
+            yield begin, end + 1 if end != _index._EOF else end
+
+    monkeypatch.setattr(_index, "_ranges", damaged_ranges)
+    destination = tmp_path / "bad.csi"
+    with pytest.raises(OSError, match="handoff"):
+        build_index(coordinate_vcf, destination, workers=4)
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".cyvcf2-index-*"))
+
+
+def test_build_index_parallel_no_overwrite(coordinate_vcf, tmp_path, monkeypatch):
+    from cyvcf2 import build_index
+    destination = tmp_path / "race.csi"
+    original = os.link
+
+    def competing_link(source, target):
+        destination.write_bytes(b"other writer")
+        original(source, target)
+
+    monkeypatch.setattr(os, "link", competing_link)
+    with pytest.raises(FileExistsError):
+        build_index(coordinate_vcf, destination, workers=2)
+    assert destination.read_bytes() == b"other writer"
+    with pytest.raises(FileExistsError):
+        build_index(coordinate_vcf, destination, workers=2)
+    assert destination.read_bytes() == b"other writer"
+    assert not list(tmp_path.glob(".cyvcf2-index-*"))
+
+
+def test_build_index_parallel_format_and_worker_errors(coordinate_vcf, tmp_path):
+    from cyvcf2 import build_index
+    destination = tmp_path / "bad.csi"
+    for workers in (0, -1, True, 1.5, None):
+        with pytest.raises(ValueError, match="positive integer"):
+            build_index(coordinate_vcf, destination, workers=workers)
+    for filename in (VCF_PATH2, os.path.join(HERE, "multi-contig.bcf")):
+        with pytest.raises(ValueError, match="BGZF-compressed VCF"):
+            build_index(filename, destination, workers=2)
+    assert not destination.exists()
+
+
+def test_build_index_parallel_batch_limit(coordinate_vcf, tmp_path, monkeypatch):
+    from cyvcf2 import build_index, _index
+    monkeypatch.setattr(_index, "_COMPRESSED_CHUNK_BYTES", 1 << 30)
+    path = tmp_path / "dense.vcf.gz"
+    text = (
+        "##fileformat=VCFv4.3\n##contig=<ID=1,length=100000>\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n"
+        + "".join("1\t%d\t.\tA\tC\t.\tPASS\t.\n" % i for i in range(1, 70001))
+    )
+    _write_index_test_bgzf(path, text.encode())
+    serial, parallel = tmp_path / "serial.csi", tmp_path / "parallel.csi"
+    build_index(path, serial)
+    build_index(path, parallel, workers=4)
+    assert gzip.decompress(serial.read_bytes()) == gzip.decompress(parallel.read_bytes())
+    with VCF(str(path)) as reader:
+        reader.set_index(str(parallel))
+        assert reader.num_records == 70000
+        assert [v.POS for v in reader("1:65535-65538")] == list(range(65535, 65539))
+
+
+def test_build_index_parallel_unsorted_and_truncated(coordinate_vcf, tmp_path):
+    from cyvcf2 import build_index
+    data = gzip.decompress(coordinate_vcf.read_bytes())
+    _write_index_test_bgzf(coordinate_vcf, data.replace(b"1\t400\t", b"1\t1\t"))
+    destination = tmp_path / "bad.csi"
+    with pytest.raises(OSError, match="coordinate-sorted"):
+        build_index(coordinate_vcf, destination, workers=4)
+    _write_index_test_bgzf(coordinate_vcf, data)
+    coordinate_vcf.write_bytes(coordinate_vcf.read_bytes()[:-50])
+    with pytest.raises(OSError):
+        build_index(coordinate_vcf, destination, workers=4)
+    assert not destination.exists()
     assert not list(tmp_path.glob(".cyvcf2-index-*"))
 
 

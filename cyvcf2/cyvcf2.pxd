@@ -1,4 +1,4 @@
-from libc.stdint cimport int64_t, uint64_t, int32_t, uint32_t, int8_t, int16_t, uint8_t, uint16_t
+from libc.stdint cimport int64_t, uint64_t, int32_t, uint32_t, int8_t, int16_t, uint8_t, uint16_t, INT64_MAX
 import numpy as np
 cimport numpy as np
 np.import_array()
@@ -7,7 +7,8 @@ cdef extern from "htslib/hts_log.h":
     void hts_set_log_level(int val)
 
 cdef extern from "string.h":
-    void* memcpy(void* dest, const void* src, size_t n)
+    int memcmp(const void *, const void *, size_t) nogil
+    void* memcpy(void* dest, const void* src, size_t n) nogil
 
 cdef extern from "relatedness.h":
     int related(int *gt_types, double *asum, int32_t *N, int32_t *ibs0,
@@ -40,8 +41,9 @@ cdef extern from "htslib/hfile.h":
 cdef extern from "htslib/bgzf.h":
     ctypedef struct BGZF:
         pass
-    BGZF *bgzf_open(const char *path, const char *mode)
-    int bgzf_close(BGZF *fp)
+    BGZF *bgzf_open(const char *path, const char *mode) nogil
+    int bgzf_close(BGZF *fp) nogil
+    int bgzf_mt(BGZF *fp, int n_threads, int n_sub_blks) nogil
     int64_t bgzf_tell(BGZF *fp) nogil
     int64_t bgzf_seek(BGZF *fp, int64_t pos, int whence) nogil
     int bgzf_getline(BGZF *fp, int delim, kstring_t *str) nogil
@@ -70,6 +72,7 @@ cdef extern from "htslib/hts.h":
 
     cdef enum htsCompression:
         no_compression
+        bgzf
 
     ctypedef struct htsFormat:
         htsExactFormat format
@@ -86,11 +89,11 @@ cdef extern from "htslib/hts.h":
 
     htsFile *hts_hopen(hFILE *fp, const char *fn, const char *mode);
     hts_idx_t *hts_idx_init(int n, int fmt, uint64_t offset0, int min_shift, int n_lvls);
-    int hts_idx_push(hts_idx_t *idx, int tid, int64_t beg, int64_t end, uint64_t offset, int is_mapped);
-    int hts_idx_finish(hts_idx_t *idx, uint64_t final_offset);
+    int hts_idx_push(hts_idx_t *idx, int tid, int64_t beg, int64_t end, uint64_t offset, int is_mapped) nogil
+    int hts_idx_finish(hts_idx_t *idx, uint64_t final_offset) nogil
     int hts_idx_set_meta(hts_idx_t *idx, uint32_t l_meta, uint8_t *meta, int is_copy);
     int hts_idx_tbi_name(hts_idx_t *idx, int tid, const char *name);
-    int hts_idx_save_as(const hts_idx_t *idx, const char *fn, const char *fnidx, int fmt);
+    int hts_idx_save_as(const hts_idx_t *idx, const char *fn, const char *fnidx, int fmt) nogil
 
     cdef int hts_verbose = 1
 
@@ -129,6 +132,17 @@ cdef extern from "htslib/tbx.h":
     hts_itr_t *tbx_itr_querys(tbx_t *tbx, char *reg) nogil
     int tbx_itr_next(htsFile *fp, tbx_t *tbx, hts_itr_t *iter, void *data) nogil;
     void tbx_destroy(tbx_t *tbx);
+
+cdef extern from "index_helpers.h":
+    cdef int CYVCF2_COORDINATE_WORKERS
+    ctypedef struct cyvcf2_tbx_interval:
+        int64_t beg, end
+        char *ss
+        char *se
+    int cyvcf2_parse_interval(size_t length, char *line, cyvcf2_tbx_interval *interval) nogil
+
+cdef extern from "htslib/hts_log.h":
+    void hts_log_error(const char *, ...) nogil
 
 cdef extern from "htslib/vcf.h":
 

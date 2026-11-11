@@ -72,6 +72,7 @@ For index creation alone, use ``build_index`` instead of ``schema_scan``:
 
     index_path = build_index("variants.vcf.gz", threads=1)
     build_index("variants.vcf.gz", index_path="variants.vcf.gz.tbi", threads=4)
+    build_index("variants.vcf.gz", index_path="parallel.csi", workers=4, threads=1)
 
 This calls HTSlib's native index builder with the GIL released. VCF uses the
 same coordinate/interval parser as tabix, without decoding sample genotypes or
@@ -81,8 +82,36 @@ is ``path + ".csi"``; explicit destinations must end in ``.csi`` or ``.tbi``.
 BCF supports CSI only. CSI uses a minimum bin size of 16,384 bases; TBI has
 the usual 512 Mi-base coordinate limit.
 
-``threads`` is a non-negative integer specifying HTSlib decompression threads;
-the default, ``0``, disables threading (unlike ``schema_scan(threads=0)``).
+``workers`` is a positive integer; the default, ``1``, keeps the direct native
+builder. With ``workers>1``, native parsing threads read disjoint VCF ranges,
+calling the same HTSlib tabix coordinate parser without genotype/statistics
+decoding. Coordinate batches are fed in file order to one native index builder,
+preserving contig ordering, interval overlaps, record counts, and offsets.
+Record-boundary handoffs are checked before an index can be published.
+
+Parallel coordinate indexing currently supports BGZF VCF and bundled HTSlib
+only: tabix's line parser is an internal interface, not an external-library ABI.
+BCF and external HTSlib builds retain the one-worker path. Parallel indexing
+reads the VCF header once; it is not a headerless generic tabix interface.
+
+``threads`` is a non-negative integer specifying HTSlib decompression threads
+**per worker**; the default, ``0``, disables extra decompression threads, not
+parsing workers (unlike ``schema_scan(threads=0)``). Positive values also create
+HTSlib I/O helper threads. Worker and decompression counts are independent and
+explicit; there is no automatic CPU-budget selection in ``build_index``.
+
+Scheduling uses roughly 4 MiB compressed ranges and at most one outstanding
+native batch per worker, each capped at 65,536 coordinate entries (2 MiB).
+Split discovery reads small windows near compressed targets, not a whole-file
+BGZF-offset list. There is no per-record temporary stream. Memory includes the
+final HTSlib index, bounded coordinate batches, per-worker decompression buffers,
+contig maps, and reusable line buffers; a single exceptionally long VCF record
+can still require a large buffer. This is not a hard RSS cap. Chunk scheduling
+is lazy, so neither the number of chunks nor their offsets are retained for the
+entire input. Random-access split candidates are CRC-checked and adjacent native
+readers must agree exactly on the resulting record boundary; a mismatch fails
+explicitly instead of publishing a gapped or duplicated index.
+
 The returned value is the destination path as a filesystem string.
 Existing destinations, even corrupt indexes or dangling symlinks, raise
 ``FileExistsError`` rather than being reused or overwritten. A same-directory

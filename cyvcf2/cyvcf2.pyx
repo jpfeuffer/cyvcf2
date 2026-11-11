@@ -884,12 +884,234 @@ def _schema_index_is_available(path, index_path=None, is_bcf=False):
     return False
 
 
-def build_index(path, index_path=None, threads=0):
+_coordinate_workers_available = bool(CYVCF2_COORDINATE_WORKERS)
+
+
+cdef class _CoordinateBatch:
+    cdef SchemaIndexEntry *entries
+    cdef int count
+    cdef tuple names
+    cdef readonly int64_t offset
+    cdef readonly bint done
+
+    def __cinit__(self):
+        self.entries = <SchemaIndexEntry *>stdlib.malloc(65536 * sizeof(SchemaIndexEntry))
+        if self.entries == NULL:
+            raise MemoryError("unable to allocate coordinate batch")
+
+    def __dealloc__(self):
+        stdlib.free(self.entries)
+
+
+cdef class _CoordinateReader:
+    cdef BGZF *fp
+    cdef kstring_t line
+    cdef bytes last_name
+    cdef dict name_ids
+    cdef list names
+    cdef int last_id
+    cdef int64_t end
+
+    def __cinit__(self, bytes path, int64_t start, int64_t end, int threads):
+        self.name_ids = {}
+        self.names = []
+        self.last_name = b""
+        self.last_id = -1
+        self.end = end
+        self.fp = bgzf_open(path, b"r")
+        if self.fp == NULL:
+            raise OSError("unable to open coordinate input")
+        if threads and bgzf_mt(self.fp, threads, 256) < 0:
+            raise OSError("unable to start BGZF decompression threads")
+        if bgzf_seek(self.fp, start, 0) < 0:
+            raise OSError("unable to seek to coordinate range")
+
+    def read(self):
+        cdef _CoordinateBatch batch = _CoordinateBatch()
+        cdef cyvcf2_tbx_interval interval
+        cdef int result
+        cdef char saved
+        cdef Py_ssize_t name_length
+        cdef Py_ssize_t last_length = len(self.last_name)
+        cdef const char *last_ptr = self.last_name
+        cdef int local_id = self.last_id
+        if self.fp == NULL:
+            raise ValueError("coordinate reader is closed")
+        with nogil:
+            while batch.count < 65536 and bgzf_tell(self.fp) < self.end:
+                result = bgzf_getline(self.fp, 10, &self.line)
+                if result < -1:
+                    with gil:
+                        raise OSError("error reading BGZF coordinate range")
+                if result == -1:
+                    if self.end != INT64_MAX:
+                        with gil:
+                            raise OSError("coordinate range handoff reached EOF early")
+                    batch.done = True
+                    break
+                if self.line.l and self.line.s[0] == 35:
+                    continue
+                if cyvcf2_parse_interval(self.line.l, self.line.s, &interval) < 0:
+                    hts_log_error("Skipping unparsable VCF line: %s", self.line.s)
+                    continue
+                name_length = interval.se - interval.ss
+                if (local_id < 0 or name_length != last_length or
+                        memcmp(interval.ss, last_ptr, name_length) != 0):
+                    with gil:
+                        saved = interval.se[0]
+                        interval.se[0] = 0
+                        try:
+                            self.last_name = <bytes>interval.ss
+                        finally:
+                            interval.se[0] = saved
+                        if self.last_name not in self.name_ids:
+                            self.name_ids[self.last_name] = len(self.names)
+                            self.names.append(self.last_name)
+                        local_id = self.name_ids[self.last_name]
+                        self.last_id = local_id
+                        last_length = len(self.last_name)
+                        last_ptr = self.last_name
+                batch.entries[batch.count].rid = local_id
+                batch.entries[batch.count].beg = interval.beg
+                batch.entries[batch.count].end = interval.end
+                batch.entries[batch.count].offset = bgzf_tell(self.fp)
+                batch.count += 1
+            batch.offset = bgzf_tell(self.fp)
+            if batch.offset >= self.end:
+                if batch.offset != self.end:
+                    with gil:
+                        raise OSError("coordinate range handoff does not match a record boundary")
+                batch.done = True
+        batch.names = tuple(self.names)
+        return batch
+
+    def close(self):
+        cdef int result = 0
+        if self.fp != NULL:
+            with nogil:
+                result = bgzf_close(self.fp)
+            self.fp = NULL
+        if result < 0:
+            raise OSError("error closing coordinate input")
+
+    def __dealloc__(self):
+        if self.fp != NULL:
+            bgzf_close(self.fp)
+        stdlib.free(self.line.s)
+
+
+def _coordinate_boundary(bytes path, int64_t block):
+    cdef BGZF *fp = bgzf_open(path, b"r")
+    cdef kstring_t line
+    cdef int result
+    cdef int64_t offset
+    line.s = NULL
+    line.l = line.m = 0
+    if fp == NULL:
+        raise OSError("unable to open coordinate boundary input")
+    try:
+        with nogil:
+            result = bgzf_seek(fp, block << 16, 0)
+        if result < 0:
+            raise OSError("unable to seek to coordinate boundary")
+        with nogil:
+            result = bgzf_getline(fp, 10, &line)
+            offset = bgzf_tell(fp)
+        if result < -1:
+            raise OSError("unable to read coordinate boundary")
+        if result == -1:
+            return None
+        return offset
+    finally:
+        stdlib.free(line.s)
+        bgzf_close(fp)
+
+
+cdef class _CoordinateIndexBuilder:
+    cdef hts_idx_t *index
+    cdef bytes fname, destination
+    cdef dict name_ids
+    cdef list names
+    cdef int index_format
+    cdef readonly int64_t offset0
+
+    def __cinit__(self, bytes path, bytes destination):
+        cdef htsFile *fp = hts_open(path, b"r")
+        cdef bcf_hdr_t *hdr = NULL
+        cdef int min_shift, n_levels
+        self.fname = path
+        self.destination = destination
+        self.name_ids = {}
+        self.names = []
+        self.index_format = HTS_FMT_TBI if destination.endswith(b".tbi") else HTS_FMT_CSI
+        if fp == NULL:
+            raise OSError("unable to open coordinate input")
+        try:
+            if fp.format.format != vcf or fp.format.compression != bgzf:
+                raise ValueError("parallel coordinate indexing requires BGZF-compressed VCF")
+            hdr = bcf_hdr_read(fp)
+            if hdr == NULL:
+                raise OSError("cannot read VCF header for parallel coordinate indexing")
+            self.offset0 = bgzf_tell(fp.fp.bgzf)
+            _schema_index_settings(hdr, False, self.index_format, &min_shift, &n_levels)
+            self.index = hts_idx_init(0, self.index_format, self.offset0, min_shift, n_levels)
+            if self.index == NULL:
+                raise MemoryError("unable to initialize coordinate index")
+        finally:
+            if hdr != NULL:
+                bcf_hdr_destroy(hdr)
+            hts_close(fp)
+
+    def add(self, _CoordinateBatch batch):
+        cdef int *mapping = <int *>stdlib.malloc(len(batch.names) * sizeof(int))
+        cdef int i
+        cdef int result = 0
+        cdef SchemaIndexEntry *entry
+        if mapping == NULL and batch.names:
+            raise MemoryError("unable to map coordinate contigs")
+        try:
+            for i, name in enumerate(batch.names):
+                if name not in self.name_ids:
+                    self.name_ids[name] = len(self.names)
+                    self.names.append(name)
+                mapping[i] = self.name_ids[name]
+            with nogil:
+                for i in range(batch.count):
+                    entry = batch.entries + i
+                    result = hts_idx_push(
+                        self.index, mapping[entry.rid], entry.beg, entry.end, entry.offset, 1)
+                    if result < 0:
+                        break
+            if result < 0:
+                raise OSError("cannot build index: input must be coordinate-sorted")
+        finally:
+            stdlib.free(mapping)
+
+    def finish(self, int64_t offset):
+        cdef bytes metadata = _schema_vcf_index_metadata(self.names)
+        cdef int result
+        with nogil:
+            result = hts_idx_finish(self.index, offset)
+        if result < 0:
+            raise OSError("unable to finish coordinate index")
+        if hts_idx_set_meta(self.index, len(metadata), <uint8_t *>PyBytes_AsString(metadata), 1) < 0:
+            raise MemoryError("unable to set coordinate index metadata")
+        _schema_save_index(self.index, self.fname, self.destination, self.index_format)
+
+    def __dealloc__(self):
+        if self.index != NULL:
+            hts_idx_destroy(self.index)
+
+
+def build_index(path, index_path=None, threads=0, workers=1):
     """Build an index without scanning schema or decoding sample genotypes.
 
     Requires a local, coordinate-sorted BGZF VCF/BCF. Defaults to path + ".csi";
     an explicit index_path must end in ".csi" or ".tbi" (VCF only).
     threads is the number of HTSlib decompression threads; 0 disables threading.
+    workers=1 uses HTSlib's direct builder. workers>1 parses VCF coordinates
+    in parallel with bounded batches (requires bundled HTSlib); threads then
+    controls decompression threads per worker. BCF supports one worker only.
     Returns the destination as a filesystem string. Existing destinations,
     including invalid indexes and symlinks, raise FileExistsError.
 
@@ -907,6 +1129,8 @@ def build_index(path, index_path=None, threads=0):
 
     if isinstance(threads, bool) or not isinstance(threads, int) or threads < 0:
         raise ValueError("threads must be a non-negative integer")
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise ValueError("workers must be a positive integer")
     n_threads = threads
     destination = fname + b".csi" if index_path is None else os.fsencode(index_path)
     if not fname or b"\0" in fname or not destination or b"\0" in destination:
@@ -923,6 +1147,13 @@ def build_index(path, index_path=None, threads=0):
         raise FileExistsError("index destination already exists: %s" % os.fsdecode(destination))
     if not os.path.isfile(fname):
         raise OSError("index input must be an existing local file: %s" % os.fsdecode(fname))
+
+    if workers > 1:
+        if not CYVCF2_COORDINATE_WORKERS:
+            raise NotImplementedError("parallel coordinate indexing requires bundled HTSlib")
+        from ._index import _build_parallel
+        _build_parallel(fname, destination, n_threads, workers)
+        return os.fsdecode(destination)
 
     directory = os.path.dirname(os.path.abspath(destination))
     with tempfile.TemporaryDirectory(prefix=b".cyvcf2-index-", dir=directory) as temporary:
@@ -947,12 +1178,18 @@ def build_index(path, index_path=None, threads=0):
 
 cdef void _schema_save_index(
         hts_idx_t *index, bytes fname, bytes destination, int index_format) except *:
+    cdef const char *input_ptr = fname
+    cdef const char *staging_ptr
+    cdef int result
     if b"://" in destination:
         raise ValueError("index creation requires a local destination for no-overwrite safety")
     directory = os.path.dirname(os.path.abspath(destination))
     with tempfile.TemporaryDirectory(prefix=b".cyvcf2-index-", dir=directory) as temporary:
         staging = os.path.join(temporary, b"index")
-        if hts_idx_save_as(index, fname, staging, index_format) < 0:
+        staging_ptr = staging
+        with nogil:
+            result = hts_idx_save_as(index, input_ptr, staging_ptr, index_format)
+        if result < 0:
             raise IOError("unable to save index to %s" % os.fsdecode(destination))
         # Linking is atomic and fails if another writer created the destination.
         os.link(staging, destination)
