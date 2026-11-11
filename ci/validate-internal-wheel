@@ -25,6 +25,6 @@ site="$("$python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])'
 cp -R "$tests" "$site/cyvcf2/tests"
 mkdir "$output/run"
 cd "$output/run"
-"$python" -c 'import sys, numpy, cyvcf2; import cyvcf2.cyvcf2 as extension; from cyvcf2 import VCF, Variant; assert cyvcf2.__version__ == "0.35.0+pfizer.1"; assert extension.__file__.endswith(".abi3.so"); assert hasattr(VCF, "schema_scan") and hasattr(VCF, "read_batch") and hasattr(Variant, "format_values"); print(sys.version); print("NumPy", numpy.__version__); print(extension.__file__)' > "$output/smoke.txt"
+"$python" -c 'import sys, numpy, cyvcf2; import cyvcf2.cyvcf2 as extension; from cyvcf2 import VCF, Variant, build_index, build_index_stream; assert cyvcf2.__version__ == "0.35.0+pfizer.2"; assert extension.__file__.endswith(".abi3.so"); assert hasattr(VCF, "schema_scan") and hasattr(VCF, "read_batch") and hasattr(Variant, "format_values"); assert callable(build_index) and callable(build_index_stream); assert extension._coordinate_workers_available; print(sys.version); print("NumPy", numpy.__version__); print(extension.__file__)' > "$output/smoke.txt"
 uv pip freeze --python "$python" > "$output/dependencies.txt"
 "$python" -m pytest -q "$site/cyvcf2/tests" | tee "$output/pytest.txt"

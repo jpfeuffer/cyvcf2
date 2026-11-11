@@ -1,1 +1,1 @@
-__version__ = "0.35.0+pfizer.1"
+__version__ = "0.35.0+pfizer.2"
