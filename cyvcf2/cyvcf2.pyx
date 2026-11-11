@@ -872,13 +872,13 @@ def _schema_index_is_available(path, index_path=None, is_bcf=False):
                 tbx_destroy(tbx)
                 if not valid:
                     raise OSError("existing index is not a VCF index")
-                _index_split_offsets(idxname, os.path.getsize(fname), 1, is_bcf)
+                _index_split_offsets(idxname, _schema_input_size(fname), 1, is_bcf)
                 return True
         else:
             index = hts_idx_load2(fname, idxname)
             if index != NULL:
                 hts_idx_destroy(index)
-                _index_split_offsets(idxname, os.path.getsize(fname), 1, is_bcf)
+                _index_split_offsets(idxname, _schema_input_size(fname), 1, is_bcf)
                 return True
         raise OSError("unable to read existing index: %s" % os.fsdecode(idxname))
     return False
@@ -944,6 +944,7 @@ cdef class _IndexRemoteFile:
 
 
 _coordinate_workers_available = bool(CYVCF2_COORDINATE_WORKERS)
+_remote_schema_workers_available = True
 
 
 cdef class _CoordinateBatch:
@@ -1475,6 +1476,35 @@ cdef void _schema_save_index(
         os.link(staging, destination)
 
 
+def _schema_input_size(bytes path):
+    if b"://" in path:
+        with _IndexRemoteFile(path) as source:
+            return source.size
+    return os.path.getsize(path)
+
+
+def _schema_remote_ranges(bytes path, int workers):
+    cdef htsFile *fp = NULL
+    cdef bcf_hdr_t *hdr = NULL
+    from ._schema_scan import _remote_split_ranges
+    fp = hts_open(path, b"r")
+    if fp == NULL:
+        raise OSError("unable to open remote schema input")
+    try:
+        if fp.format.format not in (vcf, bcf) or fp.format.compression != bgzf:
+            raise ValueError("remote parallel schema_scan requires BGZF-compressed VCF/BCF")
+        hdr = bcf_hdr_read(fp)
+        if hdr == NULL:
+            raise OSError("cannot parse remote VCF/BCF header")
+        return _remote_split_ranges(
+            path, workers, bgzf_tell(fp.fp.bgzf), fp.format.format == bcf)
+    finally:
+        if hdr != NULL:
+            bcf_hdr_destroy(hdr)
+        if fp != NULL:
+            hts_close(fp)
+
+
 def _schema_index_ranges(path, index_path, int workers):
     cdef htsFile *fp = NULL
     cdef bcf_hdr_t *hdr = NULL
@@ -1491,7 +1521,7 @@ def _schema_index_ranges(path, index_path, int workers):
         if hdr == NULL:
             raise IOError("cannot parse VCF/BCF header")
         boundaries, records = _index_split_offsets(
-            index_path, os.path.getsize(path), workers, fp.format.format == bcf)
+            index_path, _schema_input_size(fname), workers, fp.format.format == bcf)
         header_end = bgzf_tell(fp.fp.bgzf)
     finally:
         if hdr != NULL:
@@ -1927,6 +1957,11 @@ cdef class VCF(HTSFile):
         the number of HTSlib decompression threads per worker.
         ``workers`` parallelizes local BGZF-compressed or uncompressed VCF/BCF
         scans across independent file ranges (indexing requires BGZF).
+        Seekable S3/HTTP BGZF inputs also support parsing workers through
+        HTSlib ranged reads, without downloading or caching the source.
+        Remote splitting probes only O(workers) compressed positions, not
+        every block. Uncompressed and ordinary gzip remote inputs are not
+        supported in parallel. Each spawned worker inherits HTSlib credentials.
         An existing local CSI/TBI supplies record-offset split hints instead
         of BGZF block discovery. All records are still scanned; split boundaries
         and available index record counts are checked. Sparse indexes may yield
@@ -2032,7 +2067,7 @@ cdef class VCF(HTSFile):
             if workers is None:
                 workers = (
                     max(1, cpu_budget // 2)
-                    if self.fname is not None and b"://" not in self.fname
+                    if self.fname is not None
                     else 1
                 )
             threads = 1 if cpu_budget >= 2 else None
@@ -2041,8 +2076,14 @@ cdef class VCF(HTSFile):
         if workers > 1 and not chunked:
             if self.fname is None:
                 raise ValueError("parallel schema_scan requires a VCF filename")
-            if b"://" in self.fname:
-                raise ValueError("parallel schema_scan currently requires a local BGZF VCF/BCF")
+            remote_input = b"://" in self.fname
+            if remote_input:
+                from ._index import _validate_input
+                _validate_input(self.fname)
+                if self.hts.format.compression != bgzf:
+                    raise ValueError("remote parallel schema_scan requires BGZF-compressed VCF/BCF")
+                if index_path is not None and b"://" in os.fsencode(index_path):
+                    raise ValueError("parallel schema_scan requires a local index destination")
             is_bcf = self.hts.format.format == bcf
             if (index_path is not None and
                     self.hts.format.compression == no_compression and
@@ -2064,6 +2105,8 @@ cdef class VCF(HTSFile):
                         if os.path.lexists(candidate))
                 ranges, expected_records = _schema_index_ranges(
                     source_path, split_index, workers)
+            elif remote_input:
+                ranges = _schema_remote_ranges(self.fname, workers)
             else:
                 ranges = _schema_bgzf_ranges(source_path, workers)
             if is_bcf:
@@ -2079,7 +2122,7 @@ cdef class VCF(HTSFile):
                         build_index,
                         os.path.join(workdir, "chunk-%d.idx" % i)
                         if build_index else None,
-                        split_index is not None,
+                        split_index is not None or (remote_input and not is_bcf),
                     )
                     for i, (start, end, seek) in enumerate(ranges)
                 ]

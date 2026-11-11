@@ -51,6 +51,9 @@ def _serve_s3(objects, requests, ready, stop):
                 return
             headers = {"Accept-Ranges": "bytes"}
             range_header = self.headers.get("Range")
+            if key.endswith("/no-range.vcf.gz"):
+                self.respond(200, payload)
+                return
             if range_header:
                 begin, end = range_header.removeprefix("bytes=").split("-")
                 start = int(begin)
@@ -221,6 +224,145 @@ def test_native_s3_input(s3_server, coordinate_vcf, tmp_path, workers, suffix, p
         assert all(signed for method, _, signed in requests if method == "GET")
     assert objects["/cyvcf2-test/input.vcf.gz"] == payload
     assert all(method != "PUT" for method, _, _ in requests)
+
+
+@pytest.fixture
+def schema_remote_vcf(coordinate_vcf):
+    payload = gzip.decompress(coordinate_vcf.read_bytes()).replace(
+        b"\tGT\tinvalid\n", b"\tGT\t0/1\n")
+    payload = payload.replace(
+        b"##contig=<ID=1,length=10000>\n",
+        b"##contig=<ID=1,length=10000>\n##contig=<ID=undeclared,length=10000>\n")
+    _write_index_test_bgzf(coordinate_vcf, payload)
+    return coordinate_vcf
+
+
+@pytest.mark.parametrize("workers", [2, 4, 8])
+@pytest.mark.parametrize("protocol", ["s3+http", "http"])
+@pytest.mark.parametrize("indexed", [False, True])
+def test_parallel_remote_schema(s3_server, schema_remote_vcf, tmp_path, workers, protocol, indexed):
+    objects, requests = s3_server
+    data = schema_remote_vcf.read_bytes()
+    objects["/cyvcf2-test/schema.vcf.gz"] = data
+    source = (
+        "s3+http://cyvcf2-test/schema.vcf.gz" if protocol == "s3+http"
+        else os.environ["AWS_ENDPOINT_URL_S3"] + "/cyvcf2-test/schema.vcf.gz"
+    )
+    index = tmp_path / "schema.csi" if indexed else None
+    with VCF(str(schema_remote_vcf)) as reader:
+        expected = reader.schema_scan(threads=1)
+    with VCF(source) as reader:
+        actual = reader.schema_scan(index_path=index, workers=workers, threads=1)
+    assert actual["records"] == expected["records"] == 800
+    assert actual["index"]["built"] == indexed
+    actual.pop("index")
+    expected.pop("index")
+    assert actual == expected
+    assert any(method == "GET" and ranged for method, ranged, _ in requests)
+    if protocol == "s3+http":
+        assert all(signed for method, _, signed in requests if method == "GET")
+    if indexed:
+        with VCF(source, samples=[]) as reader:
+            reader.set_index(str(index))
+            assert reader.num_records == 800
+            assert list(reader("1:150-150"))
+        with VCF(source) as reader:
+            reused = reader.schema_scan(index_path=index, workers=workers, threads=1)
+        assert reused["index"]["built"] is False
+        reused.pop("index")
+        assert reused == expected
+    assert objects["/cyvcf2-test/schema.vcf.gz"] == data
+    assert all(method != "PUT" for method, _, _ in requests)
+
+
+def test_parallel_remote_bcf_schema(s3_server, tmp_path):
+    objects, _ = s3_server
+    path = Path(__file__).with_name("multi-contig.bcf")
+    objects["/cyvcf2-test/schema.bcf"] = path.read_bytes()
+    with VCF(str(path)) as reader:
+        expected = reader.schema_scan()
+    index = tmp_path / "remote-bcf.csi"
+    with VCF("s3+http://cyvcf2-test/schema.bcf") as reader:
+        actual = reader.schema_scan(index_path=index, workers=4, threads=1)
+    actual.pop("index")
+    expected.pop("index")
+    assert actual == expected
+    with VCF("s3+http://cyvcf2-test/schema.bcf") as reader:
+        reader.set_index(str(index))
+        assert reader.num_records == expected["records"]
+
+
+def test_parallel_remote_schema_requires_bgzf(s3_server, schema_remote_vcf):
+    objects, _ = s3_server
+    payload = gzip.decompress(schema_remote_vcf.read_bytes())
+    objects["/cyvcf2-test/plain.vcf"] = payload
+    objects["/cyvcf2-test/gzip.vcf.gz"] = gzip.compress(payload)
+    for key in ("plain.vcf", "gzip.vcf.gz"):
+        with VCF("s3+http://cyvcf2-test/" + key) as reader:
+            with pytest.raises(ValueError, match="requires BGZF"):
+                reader.schema_scan(workers=2)
+
+
+def test_parallel_remote_schema_requires_ranges(s3_server, tmp_path):
+    objects, _ = s3_server
+    path = tmp_path / "large.vcf.gz"
+    padding = os.urandom(2 << 20).hex()
+    data = (
+        '##fileformat=VCFv4.3\n'
+        '##contig=<ID=1,length=10000>\n'
+        '##INFO=<ID=PAD,Number=1,Type=String,Description="Padding">\n'
+        '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n'
+        f'1\t1\t.\tA\tC\t.\tPASS\tPAD={padding}\n'
+    ).encode()
+    _write_index_test_bgzf(path, data)
+    objects["/cyvcf2-test/no-range.vcf.gz"] = path.read_bytes()
+    with VCF("s3+http://cyvcf2-test/no-range.vcf.gz") as reader:
+        with pytest.raises(OSError, match="seekable|seek|read"):
+            reader.schema_scan(workers=2)
+
+
+def test_remote_schema_splitter_bounded_probes(schema_remote_vcf, monkeypatch):
+    from cyvcf2 import _schema_scan
+    reads = []
+
+    class Remote:
+        size = 1 << 40
+
+        def __init__(self, path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+    def block(source, target, size):
+        reads.append(target)
+        return target + 10
+
+    monkeypatch.setattr(native, "_IndexRemoteFile", Remote)
+    monkeypatch.setattr(native, "_coordinate_boundary", lambda path, block: block << 16 | 15)
+    from cyvcf2 import _index
+    monkeypatch.setattr(_index, "_next_block", block)
+    ranges = _schema_scan._remote_split_ranges(b"s3://bucket/input.vcf.gz", 8, 100, False)
+    assert len(reads) == 7
+    assert len(ranges) == 8
+    assert ranges[0][0] == -1
+    assert ranges[-1][1] == (1 << 63) - 1
+    assert all(left[1] == right[0] for left, right in zip(ranges, ranges[1:]))
+    assert all(start == seek for start, _, seek in ranges)
+
+
+def test_parallel_remote_schema_invalid_index_preserved(s3_server, schema_remote_vcf, tmp_path):
+    objects, _ = s3_server
+    objects["/cyvcf2-test/schema.vcf.gz"] = schema_remote_vcf.read_bytes()
+    destination = tmp_path / "corrupt.csi"
+    destination.write_bytes(b"existing")
+    with VCF("s3+http://cyvcf2-test/schema.vcf.gz") as reader:
+        with pytest.raises(OSError, match="existing index"):
+            reader.schema_scan(index_path=destination, workers=4)
+    assert destination.read_bytes() == b"existing"
 
 
 def test_native_s3_requires_local_destination():

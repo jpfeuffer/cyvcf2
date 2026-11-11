@@ -11,6 +11,26 @@ from fractions import Fraction
 from pathlib import Path
 
 
+def _remote_split_ranges(path, workers, header_end, is_bcf):
+    from ._index import _next_block, _validate_input
+    from .cyvcf2 import _IndexRemoteFile, _coordinate_boundary
+    _validate_input(path)
+    boundaries = []
+    with _IndexRemoteFile(path) as source:
+        for worker in range(1, workers):
+            target = source.size * worker // workers
+            if target <= header_end >> 16:
+                continue
+            block = _next_block(source, target, source.size)
+            boundary = block << 16 if is_bcf else _coordinate_boundary(path, block)
+            if boundary is not None and boundary > header_end:
+                if not boundaries or boundary > boundaries[-1]:
+                    boundaries.append(boundary)
+    starts = [-1] + boundaries
+    ends = boundaries + [(1 << 63) - 1]
+    return [(start, end, start) for start, end in zip(starts, ends)]
+
+
 def _index_split_offsets(path, source_size, workers, is_bcf=False):
     """Read CSI/TBI chunk boundaries, not coordinate-query intervals."""
     with open(path, "rb") as source:

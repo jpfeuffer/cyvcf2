@@ -347,8 +347,16 @@ Linux cgroup v1/v2 CPU quotas (including visible ancestor limits), and cpusets;
 fractional CPU quotas are rounded down, with a minimum of one CPU. HTSlib also
 creates an I/O helper thread, so this is a CPU-budget heuristic rather than a
 strict OS-thread limit. Uncompressed inputs need no decompression threads.
-With a one-CPU budget, decoding is synchronous. Remote inputs retain a single
-worker. Explicit ``workers`` overrides automatic selection, even if it exceeds
+With a one-CPU budget, decoding is synchronous. Seekable remote BGZF VCF/BCF
+inputs also support parsing workers through HTSlib ranged reads, without
+downloading or caching the source. Remote split discovery probes only
+``O(workers)`` compressed positions using CRC-checked BGZF boundaries; it does
+not enumerate all blocks. Each worker inherits the process's HTSlib credential
+environment. Uncompressed or ordinary gzip remote inputs, unknown lengths and
+non-seekable objects are rejected in parallel mode. Index creation/reuse with
+parallel remote scanning currently requires a local index path; index-entry
+temporary streams retain the existing schema-scan behavior and are not source
+copies. Explicit ``workers`` overrides automatic selection, even if it exceeds
 the detected budget. Without ``threads=0``, the default remains a serial scan;
 positive ``threads`` values retain their per-worker decompression meaning.
 
