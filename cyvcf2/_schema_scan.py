@@ -13,11 +13,11 @@ from pathlib import Path
 
 
 class _SchemaProgress:
-    def __init__(self, path, callback):
+    def __init__(self, path, callback, *, defer_size=False):
         from .cyvcf2 import _schema_input_size
         if not callable(callback):
             raise TypeError("progress must be callable or None")
-        self.size = _schema_input_size(path)
+        self.size = None if defer_size else _schema_input_size(path)
         self.callback = callback
         self.started = self.last_report = time.monotonic()
         self.processed = 0
@@ -75,12 +75,15 @@ def _schema_progress_result(future, progress, paths, ranges):
     return future.result()
 
 
-def _remote_split_ranges(path, workers, header_end, is_bcf):
+def _remote_split_ranges(path, workers, header_end, is_bcf, progress=None):
     from ._index import _next_block, _validate_input
     from .cyvcf2 import _IndexRemoteFile, _coordinate_boundary
     _validate_input(path)
     boundaries = []
     with _IndexRemoteFile(path) as source:
+        if progress is not None and progress.size is None:
+            progress.size = source.size
+            progress.update(0, 0, force=True)
         for worker in range(1, workers):
             target = source.size * worker // workers
             if target <= header_end >> 16:

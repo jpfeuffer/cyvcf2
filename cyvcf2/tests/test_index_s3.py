@@ -356,6 +356,12 @@ def test_remote_schema_splitter_bounded_probes(schema_remote_vcf, monkeypatch):
     assert ranges[-1][1] == (1 << 63) - 1
     assert all(left[1] == right[0] for left, right in zip(ranges, ranges[1:]))
     assert all(start == seek for start, _, seek in ranges)
+    events = []
+    reporter = _schema_scan._SchemaProgress(
+        b"s3://bucket/input.vcf.gz", events.append, defer_size=True)
+    _schema_scan._remote_split_ranges(b"s3://bucket/input.vcf.gz", 8, 100, False, reporter)
+    assert reporter.size == 1 << 40
+    assert events[0]["fraction"] == 0
 
 
 def test_parallel_remote_schema_invalid_index_preserved(s3_server, schema_remote_vcf, tmp_path):

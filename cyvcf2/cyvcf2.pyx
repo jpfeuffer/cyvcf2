@@ -1509,7 +1509,7 @@ def _schema_input_size(bytes path):
     return os.path.getsize(path)
 
 
-def _schema_remote_ranges(bytes path, int workers):
+def _schema_remote_ranges(bytes path, int workers, progress=None):
     cdef htsFile *fp = NULL
     cdef bcf_hdr_t *hdr = NULL
     from ._schema_scan import _remote_split_ranges
@@ -1523,7 +1523,7 @@ def _schema_remote_ranges(bytes path, int workers):
         if hdr == NULL:
             raise OSError("cannot parse remote VCF/BCF header")
         return _remote_split_ranges(
-            path, workers, bgzf_tell(fp.fp.bgzf), fp.format.format == bcf)
+            path, workers, bgzf_tell(fp.fp.bgzf), fp.format.format == bcf, progress)
     finally:
         if hdr != NULL:
             bcf_hdr_destroy(hdr)
@@ -2086,17 +2086,6 @@ cdef class VCF(HTSFile):
         collect_chunk_index = self._schema_collect_chunk_index
         chunk_config = self._schema_chunk
         progress_reporter = None
-        if progress is not None:
-            if chunked:
-                progress_reporter = progress
-            else:
-                if self.fname is None:
-                    raise ValueError("schema_scan requires a VCF/BCF filename")
-                if self.hts.format.compression not in (no_compression, bgzf):
-                    raise ValueError("schema progress requires BGZF or uncompressed input")
-                from ._schema_scan import _SchemaProgress, _schema_progress_result
-                progress_reporter = _SchemaProgress(self.fname, progress)
-                progress_reporter.update(0, 0, force=True)
         if chunked:
             _chunk_start, _chunk_end, _seek_offset, _exact_start = chunk_config
             _chunk_index_path = self._schema_chunk_index_path
@@ -2116,6 +2105,22 @@ cdef class VCF(HTSFile):
             threads = 1 if cpu_budget >= 2 else None
         if workers is None:
             workers = 1
+        if progress is not None:
+            if chunked:
+                progress_reporter = progress
+            else:
+                if self.fname is None:
+                    raise ValueError("schema_scan requires a VCF/BCF filename")
+                if self.hts.format.compression not in (no_compression, bgzf):
+                    raise ValueError("schema progress requires BGZF or uncompressed input")
+                from ._schema_scan import _SchemaProgress, _schema_progress_result
+                defer_progress_size = (
+                    workers > 1 and b"://" in self.fname and
+                    (index_path is None or not os.path.lexists(index_path)))
+                progress_reporter = _SchemaProgress(
+                    self.fname, progress, defer_size=defer_progress_size)
+                if not defer_progress_size:
+                    progress_reporter.update(0, 0, force=True)
         if workers > 1 and not chunked:
             if self.fname is None:
                 raise ValueError("parallel schema_scan requires a VCF filename")
@@ -2149,7 +2154,7 @@ cdef class VCF(HTSFile):
                 ranges, expected_records = _schema_index_ranges(
                     source_path, split_index, workers)
             elif remote_input:
-                ranges = _schema_remote_ranges(self.fname, workers)
+                ranges = _schema_remote_ranges(self.fname, workers, progress_reporter)
             else:
                 ranges = _schema_bgzf_ranges(source_path, workers)
             if is_bcf:
