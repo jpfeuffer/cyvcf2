@@ -135,3 +135,74 @@ def test_core_stream_partial_writes(coordinate_vcf):
     output = ShortOutput()
     build_index_stream(coordinate_vcf, output)
     assert output.getvalue() == reference.getvalue()
+
+
+@pytest.mark.parametrize("bounded,workers", [(False, 4), (True, 1), (True, 4)])
+def test_index_progress(coordinate_vcf, tmp_path, bounded, workers):
+    events = []
+    destination = tmp_path / "progress.csi"
+    build_index(coordinate_vcf, destination, bounded=bounded, workers=workers, progress=events.append)
+    passes = 2 if bounded else 1
+    assert events[0]["fraction"] == 0
+    assert events[0]["eta_seconds"] is None
+    assert {event["pass"] for event in events} == set(range(1, passes + 1))
+    assert [event["fraction"] for event in events] == sorted(event["fraction"] for event in events)
+    assert events[-1]["phase"] == "complete"
+    assert events[-1]["fraction"] == 1
+    assert events[-1]["eta_seconds"] == 0
+    assert events[-1]["total_bytes"] == coordinate_vcf.stat().st_size * passes
+    reference = tmp_path / "reference.csi"
+    build_index(coordinate_vcf, reference)
+    _assert_regions(coordinate_vcf, destination, reference)
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("when", ["start", "complete"])
+def test_progress_failure_prevents_publication(coordinate_vcf, tmp_path, bounded, when):
+    destination = tmp_path / "failed.csi"
+
+    def fail(event):
+        if when == "start" or event["phase"] == "complete":
+            raise RuntimeError("progress failed")
+
+    with pytest.raises(RuntimeError, match="progress failed"):
+        build_index(coordinate_vcf, destination, workers=4, bounded=bounded, progress=fail)
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".cyvcf2-index-*"))
+
+
+def test_progress_invalid_or_unavailable(coordinate_vcf, tmp_path):
+    with pytest.raises(ValueError, match="progress requires"):
+        build_index(coordinate_vcf, tmp_path / "native.csi", progress=lambda event: None)
+    with pytest.raises(TypeError, match="progress must be callable"):
+        build_index_stream(coordinate_vcf, io.BytesIO(), progress=True)
+    with pytest.raises(TypeError, match="progress must be callable"):
+        build_index(coordinate_vcf, tmp_path / "bad.csi", workers=4, progress=True)
+
+
+def test_progress_throttle_and_eta(tmp_path, monkeypatch):
+    from cyvcf2 import _index
+    path = tmp_path / "input"
+    path.write_bytes(b"x" * 1000)
+    clock = [10.0]
+    monkeypatch.setattr(_index.time, "monotonic", lambda: clock[0])
+    events = []
+    progress = _index._IndexProgress(bytes(path), events.append, 2)
+    progress.report(1, force=True)
+    clock[0] = 10.5
+    progress.report(1, 200 << 16)
+    assert len(events) == 1
+    clock[0] = 12.0
+    progress.report(1, 500 << 16)
+    assert events[-1]["fraction"] == 0.25
+    assert events[-1]["bytes_per_second"] == 250
+    assert events[-1]["eta_seconds"] == 6
+    progress.report(2, force=True)
+    assert events[-1]["fraction"] == 0.5
+    clock[0] = 14.0
+    progress.report(2, 500 << 16)
+    assert events[-1]["fraction"] == 0.75
+    assert events[-1]["eta_seconds"] == pytest.approx(4 / 3)
+    progress.report(2, phase="complete", force=True)
+    assert events[-1]["fraction"] == 1
+    assert events[-1]["eta_seconds"] == 0

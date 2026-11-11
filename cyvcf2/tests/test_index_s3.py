@@ -197,7 +197,14 @@ def test_native_s3_input(s3_server, coordinate_vcf, tmp_path, workers, suffix, p
         else os.environ["AWS_ENDPOINT_URL_S3"] + "/cyvcf2-test/input.vcf.gz"
     )
     local = tmp_path / ("remote." + suffix)
-    assert build_index(source, local, workers=workers, threads=1, bounded=bounded) == str(local)
+    events = []
+    progress = events.append if bounded or workers > 1 else None
+    assert build_index(
+        source, local, workers=workers, threads=1, bounded=bounded, progress=progress,
+    ) == str(local)
+    if progress is not None:
+        assert events[-1]["fraction"] == 1
+        assert events[-1]["total_bytes"] == len(payload) * (2 if bounded else 1)
     with pytest.raises(FileExistsError):
         build_index(source, local, workers=workers, threads=1, bounded=bounded)
     reference = tmp_path / ("reference." + suffix)
@@ -360,6 +367,27 @@ def test_streamed_index_aborts_after_producer_failure(s3_server, coordinate_vcf,
         adapter(str(coordinate_vcf), "s3://cyvcf2-test/failed.csi")
     assert "/cyvcf2-test/failed.csi" not in objects
     assert any(method == "DELETE" and action == "abort" for method, action, _ in requests)
+
+
+def test_s3_progress_failure_does_not_publish(s3_server, coordinate_vcf):
+    pytest.importorskip("upath")
+    pytest.importorskip("s3fs")
+    script = Path(os.environ.get(
+        "CYVCF2_TEST_S3_SCRIPT",
+        str(Path(__file__).resolve().parents[2] / "scripts" / "build_index_s3.py"),
+    ))
+    if not script.exists():
+        pytest.skip("optional adapter script is not installed with the wheel")
+    adapter = runpy.run_path(str(script))["build_s3_index"]
+    objects, _ = s3_server
+
+    def fail(event):
+        if event["phase"] == "complete":
+            raise RuntimeError("progress failed")
+
+    with pytest.raises(RuntimeError, match="progress failed"):
+        adapter(str(coordinate_vcf), "s3://cyvcf2-test/progress.csi", progress=fail)
+    assert "/cyvcf2-test/progress.csi" not in objects
 
 
 def test_streamed_index_rejects_input_changed_between_passes(s3_server, coordinate_vcf, monkeypatch):

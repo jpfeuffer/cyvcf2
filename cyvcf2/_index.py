@@ -4,12 +4,55 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import os
 import struct
+import time
 import zlib
 from urllib.parse import urlsplit
 
 
 _COMPRESSED_CHUNK_BYTES = 4 << 20
 _EOF = (1 << 63) - 1
+
+
+class _IndexProgress:
+    def __init__(self, path, callback, passes):
+        from .cyvcf2 import _IndexRemoteFile
+        if not callable(callback):
+            raise TypeError("progress must be callable or None")
+        if b"://" in path:
+            with _IndexRemoteFile(path) as stream:
+                self.size = stream.size
+        else:
+            self.size = os.path.getsize(path)
+        self.callback = callback
+        self.passes = passes
+        self.started = time.monotonic()
+        self.last_report = self.started
+        self.completed = 0
+
+    def report(self, pass_number, offset=0, *, phase=None, force=False):
+        now = time.monotonic()
+        completed = (pass_number - 1) * self.size + min(offset >> 16, self.size)
+        self.completed = max(self.completed, completed)
+        if not force and now - self.last_report < 1:
+            return
+        self.last_report = now
+        total = self.size * self.passes
+        elapsed = now - self.started
+        rate = self.completed / elapsed if elapsed > 0 else 0
+        if phase == "complete":
+            self.completed = total
+            rate = total / elapsed if elapsed > 0 else 0
+        self.callback({
+            "phase": phase or ("scanning" if self.passes == 2 and pass_number == 1 else "indexing"),
+            "pass": pass_number,
+            "passes": self.passes,
+            "bytes_processed": self.completed,
+            "total_bytes": total,
+            "fraction": self.completed / total if total else 1.0,
+            "elapsed_seconds": elapsed,
+            "bytes_per_second": rate,
+            "eta_seconds": (total - self.completed) / rate if rate > 0 else None,
+        })
 
 
 def _next_block(stream, target, size):
@@ -68,12 +111,14 @@ def _ranges(path, start):
             start = boundary
 
 
-def _run_coordinate_batches(path, threads, workers, builder):
+def _run_coordinate_batches(path, threads, workers, builder, progress=None, pass_number=1):
     from .cyvcf2 import _CoordinateReader
     ranges = iter(_ranges(path, builder.offset0))
     pending = deque()
     readers = set()
     offset = builder.offset0
+    if progress is not None:
+        progress.report(pass_number, force=True)
     try:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             def submit_range():
@@ -97,34 +142,48 @@ def _run_coordinate_batches(path, threads, workers, builder):
                     pending.appendleft((reader, pool.submit(reader.read)))
                 builder.add(batch)
                 offset = batch.offset
+                if progress is not None:
+                    progress.report(pass_number, offset)
         builder.finish(offset)
     finally:
         for reader in readers:
             reader.close()
 
 
-def _build_parallel(path, destination, threads, workers):
+def _build_parallel(path, destination, threads, workers, progress=None):
     from .cyvcf2 import _CoordinateIndexBuilder
-    _run_coordinate_batches(path, threads, workers, _CoordinateIndexBuilder(path, destination))
+    reporter = _IndexProgress(path, progress, 1) if progress is not None else None
+    builder = _CoordinateIndexBuilder(path, destination)
+    _run_coordinate_batches(path, threads, workers, builder, reporter)
+    if reporter is not None:
+        reporter.report(1, phase="complete", force=True)
+    builder.publish()
 
 
-def _stream_index(path, index_format, threads, workers, output_fd):
+def _stream_index(path, index_format, threads, workers, output_fd, progress=None):
     from .cyvcf2 import _StreamingCoordinateIndex
+    reporter = _IndexProgress(path, progress, 2) if progress is not None else None
     first = _StreamingCoordinateIndex(path, index_format)
-    _run_coordinate_batches(path, threads, workers, first)
+    _run_coordinate_batches(path, threads, workers, first, reporter)
     second = _StreamingCoordinateIndex(path, index_format, output_fd, first.names)
-    _run_coordinate_batches(path, threads, workers, second)
+    _run_coordinate_batches(path, threads, workers, second, reporter, 2)
     if first.fingerprint != second.fingerprint or first.total != second.total:
         raise OSError("index input changed between streaming passes")
+    if reporter is not None:
+        reporter.report(2, phase="complete", force=True)
 
 
-def build_index_stream(path, output, *, index_format="csi", threads=0, workers=1):
+def build_index_stream(path, output, *, index_format="csi", threads=0, workers=1, progress=None):
     """Write a bounded-memory CSI/TBI index to a writable binary stream.
 
     Requires a seekable BGZF VCF, bundled HTSlib and POSIX /dev/fd. Reads the
     input twice; no local staging files or full in-memory index are used.
     The caller owns output and must discard partial bytes on any exception.
     This function does not flush, close or publish the caller's stream.
+    progress(event), if supplied, receives approximate byte progress and ETA
+    at most once per second plus pass transitions/completion. It runs in the
+    producer thread; callback exceptions abort construction. Completion means
+    index construction, not output flush or remote publication.
     """
     from .cyvcf2 import _build_index_to_fd
     read_fd, write_fd = os.pipe()
@@ -134,6 +193,7 @@ def build_index_stream(path, output, *, index_format="csi", threads=0, workers=1
                 _build_index_to_fd(
                     path, sink.fileno(), index_format=index_format,
                     threads=threads, workers=workers,
+                    progress=progress,
                 )
 
         with ThreadPoolExecutor(max_workers=1) as pool:

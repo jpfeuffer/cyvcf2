@@ -1171,6 +1171,8 @@ cdef class _CoordinateIndexBuilder:
             raise OSError("unable to finish coordinate index")
         if hts_idx_set_meta(self.index, len(metadata), <uint8_t *>PyBytes_AsString(metadata), 1) < 0:
             raise MemoryError("unable to set coordinate index metadata")
+
+    def publish(self):
         _schema_save_index(self.index, self.fname, self.destination, self.index_format)
 
     def __dealloc__(self):
@@ -1333,7 +1335,7 @@ cdef void _check_index_result(int result, bytes fname, bytes destination) except
             "BCF requires a .csi index (status %d)" % (os.fsdecode(fname), result))
 
 
-def _build_index_to_fd(path, fd, index_format="csi", threads=0, workers=1):
+def _build_index_to_fd(path, fd, index_format="csi", threads=0, workers=1, progress=None):
     """Write a finalized native index to a POSIX pipe without staging files."""
     import stat
     from ._index import _validate_input, _stream_index
@@ -1354,10 +1356,10 @@ def _build_index_to_fd(path, fd, index_format="csi", threads=0, workers=1):
         raise NotImplementedError("native index pipe output requires POSIX /dev/fd")
     if not CYVCF2_COORDINATE_WORKERS:
         raise NotImplementedError("bounded streaming indexing requires bundled HTSlib")
-    _stream_index(fname, index_format, n_threads, workers, fd)
+    _stream_index(fname, index_format, n_threads, workers, fd, progress)
 
 
-def build_index(path, index_path=None, threads=0, workers=1, *, bounded=False):
+def build_index(path, index_path=None, threads=0, workers=1, *, bounded=False, progress=None):
     """Build an index without scanning schema or decoding sample genotypes.
 
     Requires coordinate-sorted BGZF VCF/BCF. Local input defaults to path + ".csi";
@@ -1373,6 +1375,9 @@ def build_index(path, index_path=None, threads=0, workers=1, *, bounded=False):
     of accumulating the full index. Requires bundled HTSlib and POSIX /dev/fd.
     Local publication still uses atomic staging; build_index_stream writes
     to a caller-owned binary stream without staging files.
+    progress(event) optionally reports approximate compressed-byte progress
+    and ETA for parallel or bounded indexing. The direct HTSlib path does not
+    support progress. Callback exceptions abort construction before publication.
 
     Uses HTSlib's tabix parser for VCF: malformed text lines may be logged and
     skipped. Success is not full VCF, schema, or genotype validation.
@@ -1389,6 +1394,11 @@ def build_index(path, index_path=None, threads=0, workers=1, *, bounded=False):
     n_threads = _index_threads(threads, workers)
     if not isinstance(bounded, bool):
         raise ValueError("bounded must be a boolean")
+    if progress is not None:
+        if not callable(progress):
+            raise TypeError("progress must be callable or None")
+        if not bounded and workers == 1:
+            raise ValueError("progress requires workers>1 or bounded=True")
     destination = fname + b".csi" if index_path is None else os.fsencode(index_path)
     if not fname or b"\0" in fname or not destination or b"\0" in destination:
         raise ValueError("input and index paths must be non-empty and contain no NUL bytes")
@@ -1422,6 +1432,7 @@ def build_index(path, index_path=None, threads=0, workers=1, *, bounded=False):
                 build_index_stream(
                     path, output, index_format="csi" if min_shift else "tbi",
                     threads=n_threads, workers=workers,
+                    progress=progress,
                 )
             os.link(staging, destination)
         return os.fsdecode(destination)
@@ -1430,7 +1441,7 @@ def build_index(path, index_path=None, threads=0, workers=1, *, bounded=False):
         if not CYVCF2_COORDINATE_WORKERS:
             raise NotImplementedError("parallel coordinate indexing requires bundled HTSlib")
         from ._index import _build_parallel
-        _build_parallel(fname, destination, n_threads, workers)
+        _build_parallel(fname, destination, n_threads, workers, progress)
         return os.fsdecode(destination)
 
     directory = os.path.dirname(os.path.abspath(destination))

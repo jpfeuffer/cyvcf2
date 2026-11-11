@@ -119,6 +119,45 @@ temporary file and atomic hard link also prevent overwriting a destination
 created concurrently. Native indexing and publication failures raise exceptions;
 temporary files are cleaned up.
 
+Approximate progress and ETA
+----------------------------
+
+Parallel ``build_index(..., workers=4)`` and bounded indexing accept an optional
+``progress(event)`` callback. The default is silent. For example:
+
+.. code-block:: python
+
+    def report(event):
+        eta = event["eta_seconds"]
+        remaining = "unknown" if eta is None else f"{eta:.0f}s"
+        print(f'{event["fraction"]:.1%}, ETA {remaining}', flush=True)
+
+    build_index("variants.vcf.gz", "progress.csi", workers=4, progress=report)
+
+Events are dictionaries with ``phase`` (``scanning``, ``indexing``, or
+``complete``), ``pass``, ``passes``, ``bytes_processed``, ``total_bytes``,
+``fraction`` (0 to 1), ``elapsed_seconds``, ``bytes_per_second`` and
+``eta_seconds``. Byte counts track ordered, completed BGZF compressed offsets,
+not decoded bytes or speculative worker reads. The estimate uses average
+throughput since construction started and accounts for both passes in bounded
+mode. ETA is ``None`` until throughput is available, then a rough estimate:
+record complexity, compression ratios, storage and network speed can change.
+Reporting adds no input scan and is throttled to once per second, except
+pass starts and completion.
+
+``build_index_stream(..., progress=report)`` uses the same events; its callback
+runs in the producer thread and must be thread-safe. ``complete`` means index
+construction finished, **not** stream flush, remote upload completion, or atomic
+publication. Callback exceptions abort construction; local ``build_index``
+does not publish an index if a callback fails. Stream callers must discard any
+partial output as with other failures.
+
+The direct HTSlib path (``workers=1, bounded=False``) has no progress hook and
+rejects a callback rather than reporting misleading progress. ``schema_scan``
+is unchanged and has no progress callback. The optional S3 script accepts
+``--progress`` to log percentage, pass, compressed MiB/s and ETA to stderr;
+successful S3 publication is logged separately after its transaction commits.
+
 Bounded-memory indexing and stream output
 ----------------------------------------
 
