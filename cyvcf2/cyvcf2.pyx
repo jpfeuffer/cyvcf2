@@ -273,6 +273,21 @@ cdef inline int64_t _schema_raw_offset(int64_t offset) nogil:
     return ((offset >> 16) + (offset & 0xFFFF)) << 16
 
 
+cdef int64_t _schema_progress_bytes(htsFile *fp, BGZF *chunk_fp, bint chunked) except -1:
+    cdef int64_t offset
+    if chunked:
+        offset = bgzf_tell(chunk_fp)
+    elif fp.is_bgzf:
+        offset = bgzf_tell(fp.fp.bgzf)
+    else:
+        return htell(fp.fp.hfile)
+    if offset < 0:
+        raise OSError("unable to read schema progress offset")
+    if fp.format.compression == no_compression:
+        offset = _schema_raw_offset(offset)
+    return offset >> 16
+
+
 cdef inline uint32_t _schema_u32(const uint8_t *data) nogil:
     return (<uint32_t>data[0] | (<uint32_t>data[1] << 8) |
             (<uint32_t>data[2] << 16) | (<uint32_t>data[3] << 24))
@@ -722,7 +737,7 @@ cdef class _SchemaIndexBuilder:
         finally:
             source.close()
 
-    def finish(self, int64_t final_offset):
+    def finish(self, int64_t final_offset, publish=True):
         cdef bytes metadata
 
         if self.finished:
@@ -736,8 +751,14 @@ cdef class _SchemaIndexBuilder:
                     self.index, len(metadata),
                     <uint8_t *>PyBytes_AsString(metadata), 1) < 0:
                 raise MemoryError("unable to set tabix index metadata")
-        _schema_save_index(self.index, self.fname, self.index_path, self.index_format)
         self.finished = True
+        if publish:
+            self.publish()
+
+    def publish(self):
+        if not self.finished:
+            raise ValueError("index builder is not finished")
+        _schema_save_index(self.index, self.fname, self.index_path, self.index_format)
 
     def __dealloc__(self):
         if self.index != NULL:
@@ -831,12 +852,16 @@ def _schema_bgzf_ranges(path, int workers):
 
 def _schema_scan_worker(args):
     (path, start, end, seek, threads, collect_index, index_entries_path,
-     exact_start) = args
+     exact_start) = args[:8]
+    progress = None
+    if len(args) > 8:
+        from ._schema_scan import _SchemaWorkerProgress
+        progress = _SchemaWorkerProgress(args[8])
     reader = VCF(path)
     try:
         return reader._schema_scan_chunk(
             start, end, seek, threads, collect_index, index_entries_path,
-            exact_start)
+            exact_start, progress)
     finally:
         reader.close()
 
@@ -945,6 +970,7 @@ cdef class _IndexRemoteFile:
 
 _coordinate_workers_available = bool(CYVCF2_COORDINATE_WORKERS)
 _remote_schema_workers_available = True
+_schema_scan_progress_available = True
 
 
 cdef class _CoordinateBatch:
@@ -1928,22 +1954,27 @@ cdef class VCF(HTSFile):
 
     def _schema_scan_chunk(
             self, start, end, seek, threads, collect_index, index_entries_path,
-            exact_start=False):
+            exact_start=False, progress=None):
         self._schema_chunk = (start, end, seek, exact_start)
         self._schema_collect_chunk_index = collect_index
         self._schema_chunk_index_path = index_entries_path
         try:
-            return self.schema_scan(threads=threads)
+            return self.schema_scan(threads=threads, progress=progress)
         finally:
             self._schema_chunk = None
             self._schema_collect_chunk_index = False
             self._schema_chunk_index_path = None
 
-    def schema_scan(self, index_path=None, threads=None, workers=None):
+    def schema_scan(self, index_path=None, threads=None, workers=None, *, progress=None):
         """Scan the complete VCF/BCF and return compact field statistics.
 
         ``index_path`` may name an existing index to reuse, or a destination
         where an index will be built during this scan if it does not exist.
+        Optional progress(event) reports approximate completed input bytes,
+        record count, throughput and ETA once per second plus phase changes.
+        Parallel progress is aggregated in the parent; callbacks need not be
+        pickleable. Callback exceptions abort before new index publication.
+        Byte progress supports BGZF and uncompressed input, not ordinary gzip.
         No index is created when ``index_path`` is ``None``. Index creation
         requires a BGZF-compressed, coordinate-sorted input file.
         Existing indexes are never overwritten. Unreadable or invalid local
@@ -2054,6 +2085,18 @@ cdef class VCF(HTSFile):
         chunked = self._schema_chunk is not None
         collect_chunk_index = self._schema_collect_chunk_index
         chunk_config = self._schema_chunk
+        progress_reporter = None
+        if progress is not None:
+            if chunked:
+                progress_reporter = progress
+            else:
+                if self.fname is None:
+                    raise ValueError("schema_scan requires a VCF/BCF filename")
+                if self.hts.format.compression not in (no_compression, bgzf):
+                    raise ValueError("schema progress requires BGZF or uncompressed input")
+                from ._schema_scan import _SchemaProgress, _schema_progress_result
+                progress_reporter = _SchemaProgress(self.fname, progress)
+                progress_reporter.update(0, 0, force=True)
         if chunked:
             _chunk_start, _chunk_end, _seek_offset, _exact_start = chunk_config
             _chunk_index_path = self._schema_chunk_index_path
@@ -2116,6 +2159,13 @@ cdef class VCF(HTSFile):
             from tempfile import TemporaryDirectory
             chunk_summaries = []
             with TemporaryDirectory(prefix="cyvcf2-schema-scan-") as workdir:
+                progress_paths = []
+                if progress_reporter is not None:
+                    for i in range(len(ranges)):
+                        progress_path = os.path.join(workdir, "progress-%d" % i)
+                        with open(progress_path, "wb") as output:
+                            output.write(b"\0" * 16)
+                        progress_paths.append(progress_path)
                 tasks = [
                     (
                         source_path, start, end, seek, threads,
@@ -2126,6 +2176,8 @@ cdef class VCF(HTSFile):
                     )
                     for i, (start, end, seek) in enumerate(ranges)
                 ]
+                if progress_paths:
+                    tasks = [task + (progress_paths[i],) for i, task in enumerate(tasks)]
                 builder = (
                     _SchemaIndexBuilder(self.fname, index_path)
                     if build_index else None
@@ -2139,7 +2191,9 @@ cdef class VCF(HTSFile):
                     ]
                     expected_start = None
                     for i, future in enumerate(futures):
-                        chunk_summary = future.result()
+                        chunk_summary = (
+                            future.result() if progress_reporter is None else
+                            _schema_progress_result(future, progress_reporter, progress_paths, ranges))
                         if (i > 0 and
                                 chunk_summary["_actual_start"] != expected_start):
                             if split_index is not None:
@@ -2150,8 +2204,10 @@ cdef class VCF(HTSFile):
                             task[1] = expected_start
                             task[3] = expected_start
                             task[7] = True
-                            chunk_summary = pool.submit(
-                                _schema_scan_worker, tuple(task)).result()
+                            retry = pool.submit(_schema_scan_worker, tuple(task))
+                            chunk_summary = (
+                                retry.result() if progress_reporter is None else
+                                _schema_progress_result(retry, progress_reporter, progress_paths, ranges))
                         expected_start = chunk_summary.pop("_next_start")
                         chunk_summary.pop("_actual_start")
                         final_offset = chunk_summary.pop("_final_offset")
@@ -2159,12 +2215,21 @@ cdef class VCF(HTSFile):
                             builder.add_file(
                                 chunk_summary.pop("_index_entries_path"))
                         chunk_summaries.append(chunk_summary)
+                if progress_reporter is not None:
+                    progress_reporter.update(
+                        progress_reporter.size,
+                        sum(part["records"] for part in chunk_summaries),
+                        force=True, phase="finalizing")
                 if build_index:
-                    builder.finish(final_offset)
+                    builder.finish(final_offset, publish=False)
             summary = _merge_schema_scan_summaries(chunk_summaries)
             if expected_records is not None and summary["records"] != expected_records:
                 raise OSError("index record count does not match the input")
+            if progress_reporter is not None:
+                progress_reporter.update(
+                    progress_reporter.size, summary["records"], force=True, phase="complete")
             if build_index:
+                builder.publish()
                 index_available = True
                 index_created = True
             summary["index"] = {
@@ -2595,7 +2660,14 @@ cdef class VCF(HTSFile):
                                 ploidy_counts[value_index] = 0
                             ploidy_capacity = ploidy
                         ploidy_counts[ploidy] += 1
+                if progress_reporter is not None and record_count % 1024 == 0:
+                    progress_reporter.update(
+                        _schema_progress_bytes(scan_hts, chunk_fp, chunked), record_count)
 
+            if progress_reporter is not None:
+                progress_reporter.update(
+                    _schema_progress_bytes(scan_hts, chunk_fp, chunked),
+                    record_count, force=True, phase="finalizing")
             if chunked:
                 chunk_final_offset = bgzf_tell(chunk_fp)
                 if collect_chunk_index:
@@ -2617,9 +2689,6 @@ cdef class VCF(HTSFile):
                             index, len(index_metadata),
                             <uint8_t *>PyBytes_AsString(index_metadata), 1) < 0:
                         raise MemoryError("unable to set tabix index metadata")
-                _schema_save_index(index, self.fname, index_path_bytes, index_format)
-                index_available = True
-                index_created = True
 
             fields = {"INFO": {}, "FORMAT": {}}
             for is_info in (True, False):
@@ -2698,6 +2767,14 @@ cdef class VCF(HTSFile):
                 summary["_next_start"] = record_offset
                 if collect_chunk_index:
                     summary["_index_entries_path"] = _chunk_index_path
+            if progress_reporter is not None:
+                progress_reporter.update(
+                    _schema_progress_bytes(scan_hts, chunk_fp, chunked),
+                    record_count, force=True, phase="complete")
+            if build_index:
+                _schema_save_index(index, self.fname, index_path_bytes, index_format)
+                summary["index"]["available"] = True
+                summary["index"]["built"] = True
             return summary
         finally:
             if record != NULL:

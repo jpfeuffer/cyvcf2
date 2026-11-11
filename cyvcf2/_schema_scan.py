@@ -7,8 +7,72 @@ import sys
 import warnings
 import gzip
 import struct
+import time
 from fractions import Fraction
 from pathlib import Path
+
+
+class _SchemaProgress:
+    def __init__(self, path, callback):
+        from .cyvcf2 import _schema_input_size
+        if not callable(callback):
+            raise TypeError("progress must be callable or None")
+        self.size = _schema_input_size(path)
+        self.callback = callback
+        self.started = self.last_report = time.monotonic()
+        self.processed = 0
+
+    def update(self, processed, records, *, force=False, phase="scanning"):
+        now = time.monotonic()
+        self.processed = max(self.processed, min(processed, self.size))
+        if not force and now - self.last_report < 1:
+            return
+        self.last_report = now
+        elapsed = now - self.started
+        if phase == "complete":
+            self.processed = self.size
+        rate = self.processed / elapsed if elapsed > 0 else 0
+        self.callback({
+            "phase": phase, "pass": 1, "passes": 1,
+            "bytes_processed": self.processed, "total_bytes": self.size,
+            "fraction": self.processed / self.size if self.size else 1.0,
+            "records": records, "elapsed_seconds": elapsed,
+            "bytes_per_second": rate,
+            "eta_seconds": (self.size - self.processed) / rate if rate > 0 else None,
+        })
+
+    def poll(self, paths, ranges):
+        processed = records = 0
+        for path, (start, end, _) in zip(paths, ranges):
+            with open(path, "rb") as source:
+                offset, count = struct.unpack("<QQ", source.read(16))
+            begin = max(0, start) >> 16
+            limit = min(self.size, end >> 16)
+            processed += max(0, min(offset, limit) - begin)
+            records += count
+        self.update(processed, records)
+
+
+class _SchemaWorkerProgress:
+    def __init__(self, path):
+        self.path = path
+        self.last_report = time.monotonic()
+
+    def update(self, processed, records, *, force=False, phase="scanning"):
+        now = time.monotonic()
+        if force or now - self.last_report >= 1:
+            with open(self.path, "r+b", buffering=0) as output:
+                output.write(struct.pack("<QQ", processed, records))
+            self.last_report = now
+
+
+def _schema_progress_result(future, progress, paths, ranges):
+    from concurrent.futures import wait
+    while not future.done():
+        wait([future], timeout=0.1)
+        progress.poll(paths, ranges)
+    progress.poll(paths, ranges)
+    return future.result()
 
 
 def _remote_split_ranges(path, workers, header_end, is_bcf):

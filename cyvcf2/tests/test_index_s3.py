@@ -252,7 +252,11 @@ def test_parallel_remote_schema(s3_server, schema_remote_vcf, tmp_path, workers,
     with VCF(str(schema_remote_vcf)) as reader:
         expected = reader.schema_scan(threads=1)
     with VCF(source) as reader:
-        actual = reader.schema_scan(index_path=index, workers=workers, threads=1)
+        events = []
+        actual = reader.schema_scan(
+            index_path=index, workers=workers, threads=1, progress=events.append)
+    assert events[-1]["fraction"] == 1
+    assert events[-1]["records"] == 800
     assert actual["records"] == expected["records"] == 800
     assert actual["index"]["built"] == indexed
     actual.pop("index")

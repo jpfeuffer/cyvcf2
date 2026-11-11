@@ -154,7 +154,17 @@ partial output as with other failures.
 
 The direct HTSlib path (``workers=1, bounded=False``) has no progress hook and
 rejects a callback rather than reporting misleading progress. ``schema_scan``
-is unchanged and has no progress callback. The optional S3 script accepts
+also accepts ``progress=report``, with a ``records`` count in each event.
+Schema events use ``scanning``, ``finalizing`` and ``complete`` phases and
+aggregate actual parsing-worker progress in the parent process; user callbacks
+do not need to be pickleable. BGZF events measure compressed input bytes;
+uncompressed inputs measure raw bytes. Ordinary gzip inputs do not currently
+support schema byte-progress reporting and reject a callback explicitly.
+Worker offsets are sampled into fixed 16-byte temporary progress files, one
+per worker, at most once per second. These files contain only counters, never
+source records. Progress is approximate and can miss brief sub-second work.
+Completion is reported before atomic index publication, so callback failures
+never publish a newly built local index. The optional S3 script accepts
 ``--progress`` to log percentage, pass, compressed MiB/s and ETA to stderr;
 successful S3 publication is logged separately after its transaction commits.
 
