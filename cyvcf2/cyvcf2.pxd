@@ -132,6 +132,8 @@ cdef extern from "htslib/tbx.h":
 
 cdef extern from "htslib/vcf.h":
 
+    int bcf_index_build3(const char *fn, const char *fnidx, int min_shift, int n_threads) nogil
+
     ctypedef struct hts_idx_t:
         pass
 

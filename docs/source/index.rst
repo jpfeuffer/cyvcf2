@@ -64,6 +64,37 @@ See the :ref:`api` for detailed documentation, but the most common usage is summ
 Schema scanning and index creation
 ==================================
 
+For index creation alone, use ``build_index`` instead of ``schema_scan``:
+
+.. code-block:: python
+
+    from cyvcf2 import build_index
+
+    index_path = build_index("variants.vcf.gz", threads=1)
+    build_index("variants.vcf.gz", index_path="variants.vcf.gz.tbi", threads=4)
+
+This calls HTSlib's native index builder with the GIL released. VCF uses the
+same coordinate/interval parser as tabix, without decoding sample genotypes or
+collecting schema statistics. BCF uses HTSlib's BCF index builder. Inputs must
+be local, coordinate-sorted, BGZF-compressed VCF/BCF files. The default output
+is ``path + ".csi"``; explicit destinations must end in ``.csi`` or ``.tbi``.
+BCF supports CSI only. CSI uses a minimum bin size of 16,384 bases; TBI has
+the usual 512 Mi-base coordinate limit.
+
+``threads`` is a non-negative integer specifying HTSlib decompression threads;
+the default, ``0``, disables threading (unlike ``schema_scan(threads=0)``).
+The returned value is the destination path as a filesystem string.
+Existing destinations, even corrupt indexes or dangling symlinks, raise
+``FileExistsError`` rather than being reused or overwritten. A same-directory
+temporary file and atomic hard link also prevent overwriting a destination
+created concurrently. Native indexing and publication failures raise exceptions;
+temporary files are cleaned up.
+
+**Indexing is not full VCF validation.** Like tabix, HTSlib's VCF index parser
+can log and skip unparsable text lines; a successful index does not certify
+every record, sample genotype, or schema field. Use ``schema_scan`` when full
+schema and genotype summaries are required. Its behavior is unchanged.
+
 ``VCF.schema_scan()`` reads the complete file through HTSlib and returns
 record, allele, genotype-ploidy, INFO, and FORMAT summaries without creating
 Python objects for individual records. It scans an independent input stream,

@@ -1636,6 +1636,160 @@ def test_schema_scan_logical_string_cardinality_parallel(tmp_path, mode):
     assert parallel["fields"]["INFO"]["PAD"]["logical_cardinality"] == {"min": 1, "max": 1}
 
 
+@pytest.mark.parametrize("filename,suffix", [
+    ("multi-contig.vcf.gz", "csi"),
+    ("multi-contig.vcf.gz", "tbi"),
+    ("multi-contig.bcf", "csi"),
+])
+@pytest.mark.parametrize("threads", [0, 1, 4])
+def test_build_index_queries(tmp_path, filename, suffix, threads):
+    from cyvcf2 import build_index
+    path = os.path.join(HERE, filename)
+    with VCF(path) as source:
+        expected = [(v.CHROM, v.POS, v.end) for v in source]
+    destination = tmp_path / ("native." + suffix)
+    assert build_index(path, destination, threads=threads) == str(destination)
+    with VCF(path) as reader:
+        reader.set_index(str(destination))
+        assert reader.num_records == len(expected)
+        for chrom, pos, end in (expected[0], expected[len(expected) // 2], expected[-1]):
+            assert (chrom, pos, end) in [
+                (v.CHROM, v.POS, v.end) for v in reader("%s:%d-%d" % (chrom, pos, pos))
+            ]
+    assert not list(tmp_path.glob(".cyvcf2-index-*"))
+
+
+def test_build_index_default_and_no_overwrite(tmp_path):
+    from cyvcf2 import build_index
+    path = tmp_path / "input.vcf.gz"
+    shutil.copyfile(VCF_PATH, path)
+    destination = build_index(path)
+    original = Path(destination).read_bytes()
+    with pytest.raises(FileExistsError):
+        build_index(os.fsencode(path))
+    assert Path(destination).read_bytes() == original
+    with VCF(str(path)) as reader:
+        assert reader.num_records == sum(1 for _ in reader)
+    Path(destination).write_bytes(b"invalid index")
+    with pytest.raises(FileExistsError):
+        build_index(path)
+    assert Path(destination).read_bytes() == b"invalid index"
+    Path(destination).unlink()
+    Path(destination).symlink_to(tmp_path / "missing")
+    with pytest.raises(FileExistsError):
+        build_index(path)
+    assert Path(destination).is_symlink()
+
+
+def test_build_index_concurrent_destination(tmp_path, monkeypatch):
+    import cyvcf2.cyvcf2 as native
+    destination = tmp_path / "race.csi"
+    original_link = os.link
+
+    def competing_link(source, target):
+        destination.write_bytes(b"other writer")
+        return original_link(source, target)
+
+    monkeypatch.setattr(os, "link", competing_link)
+    with pytest.raises(FileExistsError):
+        native.build_index(VCF_PATH, destination)
+    assert destination.read_bytes() == b"other writer"
+    assert not list(tmp_path.glob(".cyvcf2-index-*"))
+
+
+@pytest.mark.parametrize("threads", [-1, 1.5, True, None, "4"])
+def test_build_index_invalid_threads(tmp_path, threads):
+    from cyvcf2 import build_index
+    with pytest.raises(ValueError, match="non-negative integer"):
+        build_index(VCF_PATH, tmp_path / "bad.csi", threads=threads)
+    assert not list(tmp_path.iterdir())
+
+
+def test_build_index_errors(tmp_path):
+    from cyvcf2 import build_index
+    destination = tmp_path / "bad.csi"
+    with pytest.raises(OSError, match="existing local file"):
+        build_index(tmp_path / "missing.vcf.gz", destination)
+    with pytest.raises(ValueError, match="BGZF"):
+        build_index(VCF_PATH2, destination)
+    ordinary_gzip = tmp_path / "ordinary.vcf.gz"
+    ordinary_gzip.write_bytes(gzip.compress(Path(VCF_PATH2).read_bytes()))
+    with pytest.raises(ValueError, match="BGZF"):
+        build_index(ordinary_gzip, destination)
+    with pytest.raises(OSError, match="BCF requires"):
+        build_index(os.path.join(HERE, "multi-contig.bcf"), tmp_path / "bad.tbi")
+    with pytest.raises(ValueError, match="end in"):
+        build_index(VCF_PATH, tmp_path / "bad.idx")
+    with pytest.raises(ValueError, match="local"):
+        build_index("https://example.org/input.vcf.gz", destination)
+    with pytest.raises(ValueError, match="local"):
+        build_index(VCF_PATH, "https://example.org/input.csi")
+    with pytest.raises(ValueError, match="NUL"):
+        build_index(VCF_PATH + "\0", destination)
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".cyvcf2-index-*"))
+
+
+def test_build_index_unsorted(tmp_path):
+    from cyvcf2 import build_index
+    path = str(tmp_path / "unsorted.vcf.gz")
+    with VCF(VCF_PATH2) as source:
+        records = list(source)
+        with Writer(path, source) as writer:
+            for record in reversed(records):
+                writer.write_record(record)
+    destination = tmp_path / "bad.csi"
+    with pytest.raises(OSError, match="coordinate-sorted"):
+        build_index(path, destination, threads=2)
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".cyvcf2-index-*"))
+
+
+@pytest.mark.parametrize("kind", ["empty", "tabix_only", "wrong_format", "truncated"])
+def test_build_index_tabix_semantics(tmp_path, kind):
+    import struct
+    from cyvcf2 import build_index
+    header = (
+        '##fileformat=VCFv4.3\n'
+        '##contig=<ID=1,length=1000>\n'
+        '##INFO=<ID=END,Number=1,Type=Integer,Description="End">\n'
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+        '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n'
+    )
+    text = header
+    if kind == "tabix_only":
+        text += (
+            '1\t1\t.\tA\t<DEL>\t.\tPASS\tEND=100\tGT\tinvalid\n'
+            '1\t200\t.\tA\tC\t.\tPASS\t.\tGT\tinvalid\n'
+            'unparsable\n'
+        )
+    elif kind == "wrong_format":
+        text = "not a VCF\n"
+    compressed = gzip.compress(text.encode(), mtime=0)
+    block_size = len(compressed) + 8
+    block = (
+        compressed[:3] + b"\x04" + compressed[4:10]
+        + b"\x06\x00BC\x02\x00" + struct.pack("<H", block_size - 1)
+        + compressed[10:]
+    )
+    path = tmp_path / "input.vcf.gz"
+    path.write_bytes(block[:-5] if kind == "truncated" else block)
+    destination = tmp_path / "output.csi"
+    if kind in ("wrong_format", "truncated"):
+        with pytest.raises((OSError, ValueError)):
+            build_index(path, destination)
+        assert not destination.exists()
+    else:
+        build_index(path, destination, threads=2)
+        with VCF(str(path), samples=[]) as reader:
+            reader.set_index(str(destination))
+            assert reader.num_records == (0 if kind == "empty" else 2)
+            if kind == "tabix_only":
+                assert next(reader("1:50-50")).POS == 1
+                assert next(reader("1:200-200")).POS == 200
+    assert not list(tmp_path.glob(".cyvcf2-index-*"))
+
+
 def test_schema_scan_summary():
     path = os.path.join(HERE, "test.snpeff.vcf")
     vcf = VCF(path)

@@ -884,6 +884,67 @@ def _schema_index_is_available(path, index_path=None, is_bcf=False):
     return False
 
 
+def build_index(path, index_path=None, threads=0):
+    """Build an index without scanning schema or decoding sample genotypes.
+
+    Requires a local, coordinate-sorted BGZF VCF/BCF. Defaults to path + ".csi";
+    an explicit index_path must end in ".csi" or ".tbi" (VCF only).
+    threads is the number of HTSlib decompression threads; 0 disables threading.
+    Returns the destination as a filesystem string. Existing destinations,
+    including invalid indexes and symlinks, raise FileExistsError.
+
+    Uses HTSlib's tabix parser for VCF: malformed text lines may be logged and
+    skipped. Success is not full VCF, schema, or genotype validation.
+    """
+    cdef bytes fname = os.fsencode(path)
+    cdef bytes destination
+    cdef bytes staging
+    cdef const char *input_ptr
+    cdef const char *staging_ptr
+    cdef int n_threads
+    cdef int min_shift
+    cdef int result
+
+    if isinstance(threads, bool) or not isinstance(threads, int) or threads < 0:
+        raise ValueError("threads must be a non-negative integer")
+    n_threads = threads
+    destination = fname + b".csi" if index_path is None else os.fsencode(index_path)
+    if not fname or b"\0" in fname or not destination or b"\0" in destination:
+        raise ValueError("input and index paths must be non-empty and contain no NUL bytes")
+    if b"://" in fname or b"://" in destination or fname == b"-":
+        raise ValueError("index creation requires local input and destination paths")
+    if destination.endswith(b".csi"):
+        min_shift = 14
+    elif destination.endswith(b".tbi"):
+        min_shift = 0
+    else:
+        raise ValueError("index_path must end in .csi or .tbi")
+    if os.path.lexists(destination):
+        raise FileExistsError("index destination already exists: %s" % os.fsdecode(destination))
+    if not os.path.isfile(fname):
+        raise OSError("index input must be an existing local file: %s" % os.fsdecode(fname))
+
+    directory = os.path.dirname(os.path.abspath(destination))
+    with tempfile.TemporaryDirectory(prefix=b".cyvcf2-index-", dir=directory) as temporary:
+        staging = os.path.join(temporary, b"index")
+        input_ptr = fname
+        staging_ptr = staging
+        with nogil:
+            result = bcf_index_build3(input_ptr, staging_ptr, min_shift, n_threads)
+        if result == -2:
+            raise OSError("unable to open index input: %s" % os.fsdecode(fname))
+        if result == -3:
+            raise ValueError("index creation requires BGZF-compressed VCF/BCF")
+        if result == -4:
+            raise OSError("unable to save index to %s" % os.fsdecode(destination))
+        if result != 0:
+            raise OSError(
+                "HTSlib indexing failed for %s: input must be coordinate-sorted; "
+                "BCF requires a .csi index (status %d)" % (os.fsdecode(fname), result))
+        os.link(staging, destination)
+    return os.fsdecode(destination)
+
+
 cdef void _schema_save_index(
         hts_idx_t *index, bytes fname, bytes destination, int index_format) except *:
     if b"://" in destination:
