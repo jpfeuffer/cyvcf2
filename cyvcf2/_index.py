@@ -118,6 +118,39 @@ def _stream_index(path, index_format, threads, workers, output_fd):
         raise OSError("index input changed between streaming passes")
 
 
+def build_index_stream(path, output, *, index_format="csi", threads=0, workers=1):
+    """Write a bounded-memory CSI/TBI index to a writable binary stream.
+
+    Requires a seekable BGZF VCF, bundled HTSlib and POSIX /dev/fd. Reads the
+    input twice; no local staging files or full in-memory index are used.
+    The caller owns output and must discard partial bytes on any exception.
+    This function does not flush, close or publish the caller's stream.
+    """
+    from .cyvcf2 import _build_index_to_fd
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd, "rb", buffering=0) as source, os.fdopen(write_fd, "wb", buffering=0) as sink:
+        def produce():
+            with sink:
+                _build_index_to_fd(
+                    path, sink.fileno(), index_format=index_format,
+                    threads=threads, workers=workers,
+                )
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            producer = pool.submit(produce)
+            try:
+                while data := source.read(1 << 20):
+                    pending_bytes = memoryview(data)
+                    while pending_bytes:
+                        written = output.write(pending_bytes)
+                        if not isinstance(written, int) or not 0 < written <= len(pending_bytes):
+                            raise OSError("index output stream failed to write bytes")
+                        pending_bytes = pending_bytes[written:]
+                producer.result()
+            finally:
+                source.close()
+
+
 def _validate_input(path):
     if b"://" not in path:
         if path == b"-":

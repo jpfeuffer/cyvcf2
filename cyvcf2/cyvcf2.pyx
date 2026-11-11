@@ -1357,7 +1357,7 @@ def _build_index_to_fd(path, fd, index_format="csi", threads=0, workers=1):
     _stream_index(fname, index_format, n_threads, workers, fd)
 
 
-def build_index(path, index_path=None, threads=0, workers=1):
+def build_index(path, index_path=None, threads=0, workers=1, *, bounded=False):
     """Build an index without scanning schema or decoding sample genotypes.
 
     Requires coordinate-sorted BGZF VCF/BCF. Local input defaults to path + ".csi";
@@ -1369,6 +1369,10 @@ def build_index(path, index_path=None, threads=0, workers=1):
     controls decompression threads per worker. BCF supports one worker only.
     Returns the destination as a filesystem string. Existing destinations,
     including invalid indexes and symlinks, raise FileExistsError.
+    bounded=True uses the two-pass, bounded-memory VCF index builder instead
+    of accumulating the full index. Requires bundled HTSlib and POSIX /dev/fd.
+    Local publication still uses atomic staging; build_index_stream writes
+    to a caller-owned binary stream without staging files.
 
     Uses HTSlib's tabix parser for VCF: malformed text lines may be logged and
     skipped. Success is not full VCF, schema, or genotype validation.
@@ -1383,6 +1387,8 @@ def build_index(path, index_path=None, threads=0, workers=1):
     cdef int result
 
     n_threads = _index_threads(threads, workers)
+    if not isinstance(bounded, bool):
+        raise ValueError("bounded must be a boolean")
     destination = fname + b".csi" if index_path is None else os.fsencode(index_path)
     if not fname or b"\0" in fname or not destination or b"\0" in destination:
         raise ValueError("input and index paths must be non-empty and contain no NUL bytes")
@@ -1402,6 +1408,23 @@ def build_index(path, index_path=None, threads=0, workers=1):
         raise FileExistsError("index destination already exists: %s" % os.fsdecode(destination))
     if not remote_input and not os.path.isfile(fname):
         raise OSError("index input must be an existing local file: %s" % os.fsdecode(fname))
+
+    if bounded:
+        if not CYVCF2_COORDINATE_WORKERS:
+            raise NotImplementedError("bounded streaming indexing requires bundled HTSlib")
+        if not os.path.isdir("/dev/fd"):
+            raise NotImplementedError("bounded index output requires POSIX /dev/fd")
+        from ._index import build_index_stream
+        directory = os.path.dirname(os.path.abspath(destination))
+        with tempfile.TemporaryDirectory(prefix=b".cyvcf2-index-", dir=directory) as temporary:
+            staging = os.path.join(temporary, b"index")
+            with open(staging, "wb") as output:
+                build_index_stream(
+                    path, output, index_format="csi" if min_shift else "tbi",
+                    threads=n_threads, workers=workers,
+                )
+            os.link(staging, destination)
+        return os.fsdecode(destination)
 
     if workers > 1:
         if not CYVCF2_COORDINATE_WORKERS:

@@ -79,7 +79,7 @@ same coordinate/interval parser as tabix, without decoding sample genotypes or
 collecting schema statistics. BCF uses HTSlib's BCF index builder. Inputs must
 be coordinate-sorted, BGZF-compressed VCF/BCF files. Local input defaults to
 ``path + ".csi"``; explicit destinations must end in ``.csi`` or ``.tbi``.
-BCF supports CSI only. CSI uses a minimum bin size of 16,384 bases; TBI has
+BCF supports CSI only. The default CSI uses a minimum bin size of 16,384 bases; TBI has
 the usual 512 Mi-base coordinate limit.
 
 ``workers`` is a positive integer; the default, ``1``, keeps the direct native
@@ -118,6 +118,56 @@ Existing destinations, even corrupt indexes or dangling symlinks, raise
 temporary file and atomic hard link also prevent overwriting a destination
 created concurrently. Native indexing and publication failures raise exceptions;
 temporary files are cleaned up.
+
+Bounded-memory indexing and stream output
+----------------------------------------
+
+Bounded-memory indexing is available in the core package for both local and
+S3/HTTP input; it is not specific to the S3 script:
+
+.. code-block:: python
+
+    build_index("variants.vcf.gz", "bounded.csi",
+                bounded=True, workers=8, threads=1)
+    build_index("s3://bucket/variants.vcf.gz", "remote-bounded.csi",
+                bounded=True, workers=8, threads=1)
+
+``bounded=False`` is the backward-compatible default and keeps the original
+one-pass native path described above. ``bounded=True`` currently supports
+BGZF VCF, not BCF, and requires bundled HTSlib and POSIX ``/dev/fd``.
+It reads the source twice: once for contig metadata and once for the index,
+so the source must remain unchanged through both passes. Coordinate workers
+operate on bounded row batches. Index construction retains at most one chunk
+per genomic bin for one contig at a time, not the full index; at most 37,449
+bins plus 32,768 seek offsets (about 841 KiB in total) are allocated.
+Contig names are limited to 100,000 and 16 MiB of name bytes. Memory also
+includes the header, longest record, worker batches and decompression buffers
+and Python objects; it is not bounded independently of worker count or
+record/header size.
+
+The bounded index can be less selective than HTSlib's standard index: CSI
+uses coarser bins when necessary to bound memory, and each bin's records are
+covered by a single range. Some region queries may read more data.
+Local ``build_index(..., bounded=True)`` retains the same atomic staging and
+no-overwrite publication as the original builder.
+
+For **no local staging files**, the core ``build_index_stream`` function
+writes a bounded-memory index to any writable binary stream:
+
+.. code-block:: python
+
+    from cyvcf2 import build_index_stream
+
+    with open("direct.csi", "xb") as output:
+        build_index_stream("variants.vcf.gz", output,
+                           index_format="csi", workers=8, threads=1)
+
+This writes directly to the destination, without a temporary file. The caller
+owns the stream: cyvcf2 does not close, flush, commit or publish it. On failure,
+the caller must discard any partial output; a directly written local file is
+not atomically published. Transactional remote writers can withhold publication
+until the function succeeds. ``index_format`` must be ``"csi"`` (default) or
+``"tbi"``. Unlike ``build_index``, this function returns ``None``.
 
 **Indexing is not full VCF validation.** Like tabix, HTSlib's VCF index parser
 can log and skip unparsable text lines; a successful index does not certify
@@ -158,7 +208,8 @@ tooling installed only in the environment running that script:
         s3://bucket/variants.vcf.gz s3://bucket/variants.vcf.gz.csi \
         --workers 8 --threads 1
 
-The adapter streams the index through a pipe into an s3fs transactional
+The adapter calls the core ``build_index_stream`` function and streams the
+index through a pipe into an s3fs transactional
 multipart upload, with **no local input or index staging file**. It completes
 the upload only after indexing succeeds, using conditional creation to prevent
 overwriting an existing or concurrently created object. This requires an S3
@@ -167,23 +218,8 @@ unconditional-upload fallback. A failed operation attempts to abort the
 multipart upload; a provider-side lifecycle policy can clean up uploads if
 the process or network fails before the abort.
 
-The streaming adapter currently supports BGZF VCF, not BCF, and requires
-bundled HTSlib and POSIX ``/dev/fd``. It reads the source twice: once for
-contig metadata and once for the index, so the source must remain unchanged
-through both passes. Coordinate workers operate on bounded row batches. Index
-construction retains at most one chunk per genomic bin for one contig at a
-time, not the full index; at most 37,449 bins plus 32,768 seek offsets
-(about 841 KiB in total) are allocated.
-Contig names are limited to 100,000 and 16 MiB of name bytes. Memory also
-includes the header, longest record, worker batches and decompression buffers,
-Python objects and the S3 multipart buffer (at least 5 MiB); it is not bounded
-independently of worker count or record/header size.
-
-The streamed index can be less selective than HTSlib's standard index: CSI
-uses coarser bins when necessary to bound memory, and each bin's records are
-covered by a single range. Some region queries may read more data. The
-regular local ``build_index`` path still uses HTSlib's in-memory index and
-local atomic staging; use the adapter for bounded streaming to S3. HTSlib's
+The adapter has the same two-pass, format and memory characteristics as core
+bounded indexing, plus an S3 multipart buffer (at least 5 MiB). HTSlib's
 bundled S3 writer does not provide this conditional publication guarantee, so
 the core API does not silently route S3 output through it. The adapter uses the
 filesystem backend's credentials separately from HTSlib's read credentials.

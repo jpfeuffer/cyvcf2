@@ -1,32 +1,9 @@
 """Optional UPath adapter, requiring universal_pathlib>=0.2.6 and s3fs>=2026.9.0."""
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
-import os
-import shutil
-
 from upath import UPath
 
-from cyvcf2.cyvcf2 import _build_index_to_fd
-
-
-def _pipe_index(path, output, index_format, workers, threads):
-    read_fd, write_fd = os.pipe()
-    with os.fdopen(read_fd, "rb", buffering=0) as source, os.fdopen(write_fd, "wb", buffering=0) as sink:
-        def produce():
-            with sink:
-                _build_index_to_fd(
-                    path, sink.fileno(), index_format=index_format,
-                    workers=workers, threads=threads,
-                )
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            producer = pool.submit(produce)
-            try:
-                shutil.copyfileobj(source, output, length=1 << 20)
-                producer.result()
-            finally:
-                source.close()
+from cyvcf2 import build_index_stream
 
 
 def build_s3_index(path, index_path, *, workers=1, threads=0):
@@ -39,7 +16,7 @@ def build_s3_index(path, index_path, *, workers=1, threads=0):
     # Defer publication until the native producer has completed successfully.
     with destination.fs.transaction:
         with destination.open("xb", block_size=5 << 20) as output:
-            _pipe_index(path, output, suffix[1:], workers, threads)
+            build_index_stream(path, output, index_format=suffix[1:], workers=workers, threads=threads)
     return str(destination)
 
 

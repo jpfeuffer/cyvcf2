@@ -185,7 +185,8 @@ def s3_server(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("workers,suffix", [(1, "csi"), (4, "csi"), (2, "tbi")])
 @pytest.mark.parametrize("protocol", ["s3+http", "http"])
-def test_native_s3_input(s3_server, coordinate_vcf, tmp_path, workers, suffix, protocol):
+@pytest.mark.parametrize("bounded", [False, True])
+def test_native_s3_input(s3_server, coordinate_vcf, tmp_path, workers, suffix, protocol, bounded):
     if not ctypes.CDLL(native.__file__).hts_features() & (1 << 11):
         pytest.skip("HTSlib was built without S3 support")
     objects, requests = s3_server
@@ -196,12 +197,13 @@ def test_native_s3_input(s3_server, coordinate_vcf, tmp_path, workers, suffix, p
         else os.environ["AWS_ENDPOINT_URL_S3"] + "/cyvcf2-test/input.vcf.gz"
     )
     local = tmp_path / ("remote." + suffix)
-    assert build_index(source, local, workers=workers, threads=1) == str(local)
+    assert build_index(source, local, workers=workers, threads=1, bounded=bounded) == str(local)
     with pytest.raises(FileExistsError):
-        build_index(source, local, workers=workers, threads=1)
+        build_index(source, local, workers=workers, threads=1, bounded=bounded)
     reference = tmp_path / ("reference." + suffix)
     build_index(coordinate_vcf, reference)
-    assert gzip.decompress(local.read_bytes()) == gzip.decompress(reference.read_bytes())
+    if not bounded:
+        assert gzip.decompress(local.read_bytes()) == gzip.decompress(reference.read_bytes())
     with VCF(source, samples=[]) as reader:
         reader.set_index(str(local))
         assert reader.num_records == 800
@@ -270,14 +272,14 @@ def test_upath_s3_adapter(s3_server, coordinate_vcf, tmp_path, monkeypatch, work
         adapter(str(coordinate_vcf), destination)
     assert objects[object_key] == index
 
-    original = adapter.__globals__["_build_index_to_fd"]
+    original = native._build_index_to_fd
 
     def concurrent_index(*args, **kwargs):
         result = original(*args, **kwargs)
         objects["/cyvcf2-test/race.csi"] = b"concurrent destination"
         return result
 
-    monkeypatch.setitem(adapter.__globals__, "_build_index_to_fd", concurrent_index)
+    monkeypatch.setattr(native, "_build_index_to_fd", concurrent_index)
     with pytest.raises(OSError):
         adapter(str(coordinate_vcf), "s3://cyvcf2-test/race.csi")
     assert objects["/cyvcf2-test/race.csi"] == b"concurrent destination"
@@ -335,7 +337,7 @@ def test_streamed_index_region_equivalence(s3_server, tmp_path, monkeypatch, suf
                 ]
 
 
-def test_streamed_index_aborts_after_producer_failure(s3_server, coordinate_vcf):
+def test_streamed_index_aborts_after_producer_failure(s3_server, coordinate_vcf, monkeypatch):
     pytest.importorskip("upath")
     pytest.importorskip("s3fs")
     script = Path(os.environ.get(
@@ -353,7 +355,7 @@ def test_streamed_index_aborts_after_producer_failure(s3_server, coordinate_vcf)
             stream.write(data)
         raise OSError("producer failed")
 
-    adapter.__globals__["_build_index_to_fd"] = failed_producer
+    monkeypatch.setattr(native, "_build_index_to_fd", failed_producer)
     with pytest.raises(OSError, match="producer failed"):
         adapter(str(coordinate_vcf), "s3://cyvcf2-test/failed.csi")
     assert "/cyvcf2-test/failed.csi" not in objects
@@ -416,7 +418,7 @@ def test_streamed_empty_vcf(s3_server, tmp_path, suffix):
         assert reader.num_records == 0
 
 
-def test_streamed_multipart_conditional_completion(s3_server, coordinate_vcf):
+def test_streamed_multipart_conditional_completion(s3_server, coordinate_vcf, monkeypatch):
     pytest.importorskip("upath")
     pytest.importorskip("s3fs")
     script = Path(os.environ.get(
@@ -433,7 +435,7 @@ def test_streamed_multipart_conditional_completion(s3_server, coordinate_vcf):
         with os.fdopen(os.dup(fd), "wb", buffering=0) as stream:
             stream.write(data)
 
-    adapter.__globals__["_build_index_to_fd"] = producer
+    monkeypatch.setattr(native, "_build_index_to_fd", producer)
     adapter(str(coordinate_vcf), "s3://cyvcf2-test/multipart.csi")
     assert objects["/cyvcf2-test/multipart.csi"] == data
     assert sum(method == "PUT" and action == "part" for method, action, _ in requests) >= 2
@@ -444,7 +446,7 @@ def test_streamed_multipart_conditional_completion(s3_server, coordinate_vcf):
     assert any(method == "DELETE" and action == "abort" for method, action, _ in requests)
 
 
-def test_streamed_upload_failure_stops_producer(s3_server, coordinate_vcf):
+def test_streamed_upload_failure_stops_producer(s3_server, coordinate_vcf, monkeypatch):
     pytest.importorskip("upath")
     pytest.importorskip("s3fs")
     script = Path(os.environ.get(
@@ -461,7 +463,7 @@ def test_streamed_upload_failure_stops_producer(s3_server, coordinate_vcf):
             for _ in range(32):
                 stream.write(b"x" * (1 << 20))
 
-    adapter.__globals__["_build_index_to_fd"] = producer
+    monkeypatch.setattr(native, "_build_index_to_fd", producer)
     with pytest.raises(OSError):
         adapter(str(coordinate_vcf), "s3://cyvcf2-test/fail-part.csi")
     assert "/cyvcf2-test/fail-part.csi" not in objects
