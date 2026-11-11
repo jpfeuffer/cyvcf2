@@ -16,13 +16,22 @@ mkdir -p "$4"
 output="$(cd "$4" && pwd)"
 uv venv --python "$python" "$output/venv"
 python="$output/venv/bin/python"
-dependencies=(pytest==9.2.0)
+dependencies=(pytest==9.2.0 universal-pathlib==0.3.10 s3fs==2026.9.0)
 if [[ "$("$python" -c 'import sys; print(sys.version_info[:2] == (3, 12))')" == "True" ]]; then
     dependencies+=(numpy==2.0.0)
+else
+    dependencies+=(numpy==2.5.4)
 fi
 uv pip install --python "$python" --only-binary=:all: "${dependencies[@]}" "$wheel"
 site="$("$python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 cp -R "$tests" "$site/cyvcf2/tests"
+if [[ -z "${CYVCF2_TEST_S3_SCRIPT:-}" ]]; then
+    export CYVCF2_TEST_S3_SCRIPT="$(dirname "$(dirname "$tests")")/scripts/build_index_s3.py"
+fi
+if [[ ! -f "$CYVCF2_TEST_S3_SCRIPT" ]]; then
+    echo "Missing S3 adapter script for complete installed-suite validation." >&2
+    exit 1
+fi
 mkdir "$output/run"
 cd "$output/run"
 "$python" -c 'import sys, numpy, cyvcf2; import cyvcf2.cyvcf2 as extension; from cyvcf2 import VCF, Variant, build_index, build_index_stream; assert cyvcf2.__version__ == "0.35.0+pfizer.2"; assert extension.__file__.endswith(".abi3.so"); assert hasattr(VCF, "schema_scan") and hasattr(VCF, "read_batch") and hasattr(Variant, "format_values"); assert callable(build_index) and callable(build_index_stream); assert extension._coordinate_workers_available; print(sys.version); print("NumPy", numpy.__version__); print(extension.__file__)' > "$output/smoke.txt"

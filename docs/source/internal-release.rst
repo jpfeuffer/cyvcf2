@@ -70,13 +70,18 @@ Inspect wheel dependencies with ``delocate-listdeps`` or ``auditwheel show``.
 Run ``abi3audit --strict`` on both repaired wheels.
 No Homebrew paths or external HTSlib dependencies may remain. Install each
 repaired wheel in a fresh environment outside this source tree, check its
-version and all four APIs, and run the complete combined source test suite
+version and all six APIs, and run the complete combined source test suite
 against that installed wheel. Inspect the sdist for all Cython/helper sources,
 bundled HTSlib/htscodecs, and the exact-unit manifest; no local environment,
 credentials, or build outputs may be included.
 ``ci/validate-internal-wheel`` creates an isolated environment, imports the
 installed ABI3 extension outside the checkout, and runs all supplied source
 tests as a package without shadowing the installed extension.
+The validation environment includes optional UPath/s3fs test dependencies; these
+are not core runtime dependencies. Supply ``CYVCF2_TEST_S3_SCRIPT`` when the
+adapter is not at ``scripts/build_index_s3.py`` alongside the supplied source
+tree (for example, in the Linux container). The adapter must be available so
+its transactional publication tests are not silently skipped.
 
 Publish and verify
 ------------------

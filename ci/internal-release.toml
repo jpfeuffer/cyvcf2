@@ -25,7 +25,8 @@ extracted_source = "41433ed5350b4230703569b001397f2df64987e3"
 
 [units.index_only]
 branch = "jpfeuffer-cyvcf2-index-only-fast-path"
-tip = "2ebf72cce60d3077895f29f78d8be39697c9360c"
+tip = "e211ad29825fd06687a7ff5c59094f96f14dc20a"
+core_bounded_api = "2ebf72cce60d3077895f29f78d8be39697c9360c"
 serial = "112e3e6ea46b931a21dd2af1847bdeeb099bb571"
 parallel = "a5ec836934893e2b76ab928ef9735ae78f96d715"
 remote_input = "b3553d55401a57ef444a40093300976c2aecd928"
