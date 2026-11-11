@@ -884,6 +884,65 @@ def _schema_index_is_available(path, index_path=None, is_bcf=False):
     return False
 
 
+cdef class _IndexRemoteFile:
+    cdef hFILE *fp
+    cdef readonly int64_t size
+
+    def __cinit__(self, bytes path):
+        cdef const char *ptr = path
+        cdef int64_t last
+        with nogil:
+            self.fp = hopen(ptr, "r")
+        if self.fp == NULL:
+            raise OSError("unable to open remote index input through HTSlib")
+        with nogil:
+            last = hseek(self.fp, -1, 2)
+        if last < 0:
+            raise OSError("remote parallel indexing requires seekable input with a known size")
+        self.size = last + 1
+
+    def seek(self, int64_t offset):
+        cdef int64_t result
+        if self.fp == NULL:
+            raise ValueError("remote index input is closed")
+        with nogil:
+            result = hseek(self.fp, offset, 0)
+        if result < 0:
+            raise OSError("unable to seek remote index input")
+        return result
+
+    def read(self, Py_ssize_t length):
+        cdef bytes data
+        cdef char *ptr
+        cdef ssize_t got
+        if self.fp == NULL:
+            raise ValueError("remote index input is closed")
+        if length < 0:
+            raise ValueError("remote index read length must be non-negative")
+        data = PyBytes_FromStringAndSize(NULL, length)
+        ptr = PyBytes_AsString(data)
+        with nogil:
+            got = hread(self.fp, ptr, length)
+        if got < 0:
+            raise OSError("unable to read remote index input")
+        return data[:got]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        cdef int result
+        with nogil:
+            result = hclose(self.fp)
+        self.fp = NULL
+        if result < 0:
+            raise OSError("unable to close remote index input")
+
+    def __dealloc__(self):
+        if self.fp != NULL:
+            hclose(self.fp)
+
+
 _coordinate_workers_available = bool(CYVCF2_COORDINATE_WORKERS)
 
 
@@ -913,17 +972,25 @@ cdef class _CoordinateReader:
     cdef int64_t end
 
     def __cinit__(self, bytes path, int64_t start, int64_t end, int threads):
+        cdef const char *ptr = path
+        cdef int result
         self.name_ids = {}
         self.names = []
         self.last_name = b""
         self.last_id = -1
         self.end = end
-        self.fp = bgzf_open(path, b"r")
+        with nogil:
+            self.fp = bgzf_open(ptr, b"r")
         if self.fp == NULL:
             raise OSError("unable to open coordinate input")
-        if threads and bgzf_mt(self.fp, threads, 256) < 0:
-            raise OSError("unable to start BGZF decompression threads")
-        if bgzf_seek(self.fp, start, 0) < 0:
+        if threads:
+            with nogil:
+                result = bgzf_mt(self.fp, threads, 256)
+            if result < 0:
+                raise OSError("unable to start BGZF decompression threads")
+        with nogil:
+            result = bgzf_seek(self.fp, start, 0)
+        if result < 0:
             raise OSError("unable to seek to coordinate range")
 
     def read(self):
@@ -1001,12 +1068,15 @@ cdef class _CoordinateReader:
 
 
 def _coordinate_boundary(bytes path, int64_t block):
-    cdef BGZF *fp = bgzf_open(path, b"r")
+    cdef const char *ptr = path
+    cdef BGZF *fp
     cdef kstring_t line
     cdef int result
     cdef int64_t offset
     line.s = NULL
     line.l = line.m = 0
+    with nogil:
+        fp = bgzf_open(ptr, b"r")
     if fp == NULL:
         raise OSError("unable to open coordinate boundary input")
     try:
@@ -1036,7 +1106,8 @@ cdef class _CoordinateIndexBuilder:
     cdef readonly int64_t offset0
 
     def __cinit__(self, bytes path, bytes destination):
-        cdef htsFile *fp = hts_open(path, b"r")
+        cdef const char *ptr = path
+        cdef htsFile *fp
         cdef bcf_hdr_t *hdr = NULL
         cdef int min_shift, n_levels
         self.fname = path
@@ -1044,12 +1115,15 @@ cdef class _CoordinateIndexBuilder:
         self.name_ids = {}
         self.names = []
         self.index_format = HTS_FMT_TBI if destination.endswith(b".tbi") else HTS_FMT_CSI
+        with nogil:
+            fp = hts_open(ptr, b"r")
         if fp == NULL:
             raise OSError("unable to open coordinate input")
         try:
             if fp.format.format != vcf or fp.format.compression != bgzf:
                 raise ValueError("parallel coordinate indexing requires BGZF-compressed VCF")
-            hdr = bcf_hdr_read(fp)
+            with nogil:
+                hdr = bcf_hdr_read(fp)
             if hdr == NULL:
                 raise OSError("cannot read VCF header for parallel coordinate indexing")
             self.offset0 = bgzf_tell(fp.fp.bgzf)
@@ -1060,7 +1134,8 @@ cdef class _CoordinateIndexBuilder:
         finally:
             if hdr != NULL:
                 bcf_hdr_destroy(hdr)
-            hts_close(fp)
+            with nogil:
+                hts_close(fp)
 
     def add(self, _CoordinateBatch batch):
         cdef int *mapping = <int *>stdlib.malloc(len(batch.names) * sizeof(int))
@@ -1106,8 +1181,9 @@ cdef class _CoordinateIndexBuilder:
 def build_index(path, index_path=None, threads=0, workers=1):
     """Build an index without scanning schema or decoding sample genotypes.
 
-    Requires a local, coordinate-sorted BGZF VCF/BCF. Defaults to path + ".csi";
-    an explicit index_path must end in ".csi" or ".tbi" (VCF only).
+    Requires coordinate-sorted BGZF VCF/BCF. Local input defaults to path + ".csi";
+    S3/HTTP input requires an explicit local index_path. Destinations must end
+    in ".csi" or ".tbi" (VCF only).
     threads is the number of HTSlib decompression threads; 0 disables threading.
     workers=1 uses HTSlib's direct builder. workers>1 parses VCF coordinates
     in parallel with bounded batches (requires bundled HTSlib); threads then
@@ -1135,17 +1211,21 @@ def build_index(path, index_path=None, threads=0, workers=1):
     destination = fname + b".csi" if index_path is None else os.fsencode(index_path)
     if not fname or b"\0" in fname or not destination or b"\0" in destination:
         raise ValueError("input and index paths must be non-empty and contain no NUL bytes")
-    if b"://" in fname or b"://" in destination or fname == b"-":
-        raise ValueError("index creation requires local input and destination paths")
+    from ._index import _validate_input
+    remote_input = _validate_input(fname)
+    if remote_input and index_path is None:
+        raise ValueError("remote input requires an explicit local index_path")
     if destination.endswith(b".csi"):
         min_shift = 14
     elif destination.endswith(b".tbi"):
         min_shift = 0
     else:
         raise ValueError("index_path must end in .csi or .tbi")
+    if b"://" in destination:
+        raise ValueError("index destination must be local; use scripts/build_index_s3.py for S3 publication")
     if os.path.lexists(destination):
         raise FileExistsError("index destination already exists: %s" % os.fsdecode(destination))
-    if not os.path.isfile(fname):
+    if not remote_input and not os.path.isfile(fname):
         raise OSError("index input must be an existing local file: %s" % os.fsdecode(fname))
 
     if workers > 1:

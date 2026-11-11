@@ -1721,8 +1721,8 @@ def test_build_index_errors(tmp_path):
     with pytest.raises(ValueError, match="end in"):
         build_index(VCF_PATH, tmp_path / "bad.idx")
     with pytest.raises(ValueError, match="local"):
-        build_index("https://example.org/input.vcf.gz", destination)
-    with pytest.raises(ValueError, match="local"):
+        build_index("unsupported://example.org/input.vcf.gz", destination)
+    with pytest.raises(ValueError, match="destination"):
         build_index(VCF_PATH, "https://example.org/input.csi")
     with pytest.raises(ValueError, match="NUL"):
         build_index(VCF_PATH + "\0", destination)

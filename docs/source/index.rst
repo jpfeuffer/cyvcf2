@@ -77,8 +77,8 @@ For index creation alone, use ``build_index`` instead of ``schema_scan``:
 This calls HTSlib's native index builder with the GIL released. VCF uses the
 same coordinate/interval parser as tabix, without decoding sample genotypes or
 collecting schema statistics. BCF uses HTSlib's BCF index builder. Inputs must
-be local, coordinate-sorted, BGZF-compressed VCF/BCF files. The default output
-is ``path + ".csi"``; explicit destinations must end in ``.csi`` or ``.tbi``.
+be coordinate-sorted, BGZF-compressed VCF/BCF files. Local input defaults to
+``path + ".csi"``; explicit destinations must end in ``.csi`` or ``.tbi``.
 BCF supports CSI only. CSI uses a minimum bin size of 16,384 bases; TBI has
 the usual 512 Mi-base coordinate limit.
 
@@ -123,6 +123,55 @@ temporary files are cleaned up.
 can log and skip unparsable text lines; a successful index does not certify
 every record, sample genotype, or schema field. Use ``schema_scan`` when full
 schema and genotype summaries are required. Its behavior is unchanged.
+
+S3 and HTTP input
+-----------------
+
+Remote inputs are read directly through HTSlib, without downloading a local
+copy of the VCF/BCF. Supply an explicit **local** index destination:
+
+.. code-block:: python
+
+    build_index(
+        "s3://bucket/variants.vcf.gz", index_path="variants.csi",
+        workers=8, threads=1,
+    )
+
+Parallel splitting uses HTSlib range reads and requires a seekable server
+with a known object size. Network latency, request counts and available
+bandwidth can limit scaling; the local-file benchmark is not an S3 performance
+claim. HTSlib must have its S3/libcurl backend enabled and uses its own AWS
+credential configuration. For S3-compatible endpoints, it also supports
+``HTS_S3_HOST``, ``HTS_S3_ADDRESS_STYLE`` and ``s3+http://`` / ``s3+https://``.
+URLs containing embedded credentials, query strings or fragments are rejected;
+configure credentials outside the URL. The source object must remain unchanged
+during indexing; cyvcf2 does not pin all worker reads to an object version.
+
+The core package has **no AWS SDK, UPath or fsspec dependency**. For S3 output,
+the separate ``scripts/build_index_s3.py`` adapter uses optional UPath/s3fs
+tooling installed only in the environment running that script:
+
+.. code-block:: bash
+
+    uv run --with 'universal_pathlib>=0.2.6' --with 's3fs>=2026.9.0' \
+        python scripts/build_index_s3.py \
+        s3://bucket/variants.vcf.gz s3://bucket/variants.vcf.gz.csi \
+        --workers 8 --threads 1
+
+Only the finished index is staged locally, not the input data. The adapter
+uploads that file with ``UPath.fs.put_file(..., mode="create")``: s3fs uses
+conditional PUT/multipart completion to prevent overwriting an existing or
+concurrently created object. This requires an S3 provider implementing those
+conditions; there is no unconditional-upload fallback. HTSlib's bundled S3
+writer does not provide this conditional publication guarantee, so the core
+API does not silently route S3 output through it. The adapter uses the
+filesystem backend's credentials separately from HTSlib's read credentials.
+For custom endpoints, configure both backends (e.g. HTSlib's host settings and
+the filesystem's ``AWS_ENDPOINT_URL_S3``). Core local-destination publication
+continues to use the same atomic hard-link mechanism.
+
+Full schema scans
+-----------------
 
 ``VCF.schema_scan()`` reads the complete file through HTSlib and returns
 record, allele, genotype-ploidy, INFO, and FORMAT summaries without creating

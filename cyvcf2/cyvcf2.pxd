@@ -36,6 +36,10 @@ cdef extern from "htslib/hfile.h":
     ctypedef struct hFILE:
         pass
     hFILE *hdopen(int fd, const char *mode);
+    hFILE *hopen(const char *filename, const char *mode, ...) nogil
+    int hclose(hFILE *fp) nogil
+    int64_t hseek(hFILE *fp, int64_t offset, int whence) nogil
+    ssize_t hread(hFILE *fp, void *buffer, size_t count) nogil
     int64_t htell(hFILE *fp) nogil
 
 cdef extern from "htslib/bgzf.h":
@@ -85,7 +89,7 @@ cdef extern from "htslib/hts.h":
 
     int hts_detect_format(hFILE *fp, htsFormat *fmt);
 
-    htsFile *hts_open(char *fn, char *mode);
+    htsFile *hts_open(const char *fn, const char *mode) nogil
 
     htsFile *hts_hopen(hFILE *fp, const char *fn, const char *mode);
     hts_idx_t *hts_idx_init(int n, int fmt, uint64_t offset0, int min_shift, int n_lvls);
@@ -297,7 +301,7 @@ cdef extern from "htslib/vcf.h":
     int bcf_update_alleles(const bcf_hdr_t *hdr, bcf1_t *line, const char **alleles, int nals);
     int bcf_update_alleles_str(const bcf_hdr_t *hdr, bcf1_t *line, const char *alleles_string);
 
-    bcf_hdr_t *bcf_hdr_read(htsFile *fp);
+    bcf_hdr_t *bcf_hdr_read(htsFile *fp) nogil
 
     int bcf_hdr_set_samples(bcf_hdr_t *hdr, const char *samples, int is_file);
     int bcf_hdr_nsamples(const bcf_hdr_t *hdr);
@@ -318,7 +322,7 @@ cdef extern from "htslib/vcf.h":
     int bcf_hdr_add_hrec(bcf_hdr_t *hdr, bcf_hrec_t *hrec);
     void bcf_hdr_remove(bcf_hdr_t *hdr, int type, const char *key);
 
-    int hts_close(htsFile *fp);
+    int hts_close(htsFile *fp) nogil
 
     int bcf_read(htsFile *fp, const bcf_hdr_t *h, bcf1_t *v) nogil;
 

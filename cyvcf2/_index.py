@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import struct
 import zlib
+from urllib.parse import urlsplit
 
 
 _COMPRESSED_CHUNK_BYTES = 4 << 20
@@ -47,9 +48,10 @@ def _next_block(stream, target, size):
 
 
 def _ranges(path, start):
-    from .cyvcf2 import _coordinate_boundary
-    size = os.path.getsize(path)
-    with open(path, "rb") as stream:
+    from .cyvcf2 import _coordinate_boundary, _IndexRemoteFile
+    remote = b"://" in path
+    with (_IndexRemoteFile(path) if remote else open(path, "rb")) as stream:
+        size = stream.size if remote else os.path.getsize(path)
         while True:
             target = (start >> 16) + _COMPRESSED_CHUNK_BYTES
             if target >= size:
@@ -100,3 +102,16 @@ def _build_parallel(path, destination, threads, workers):
     finally:
         for reader in readers:
             reader.close()
+
+
+def _validate_input(path):
+    if b"://" not in path:
+        if path == b"-":
+            raise ValueError("index creation requires a local file or a seekable remote input")
+        return False
+    url = urlsplit(os.fsdecode(path))
+    if url.scheme not in ("s3", "s3+http", "s3+https", "http", "https"):
+        raise ValueError("index input must be local, S3, or HTTP(S)")
+    if not url.netloc or not url.path or url.username or url.query or url.fragment:
+        raise ValueError("remote index input requires a bucket/host and key, without credentials or query strings")
+    return True
