@@ -158,13 +158,34 @@ tooling installed only in the environment running that script:
         s3://bucket/variants.vcf.gz s3://bucket/variants.vcf.gz.csi \
         --workers 8 --threads 1
 
-Only the finished index is staged locally, not the input data. The adapter
-uploads that file with ``UPath.fs.put_file(..., mode="create")``: s3fs uses
-conditional PUT/multipart completion to prevent overwriting an existing or
-concurrently created object. This requires an S3 provider implementing those
-conditions; there is no unconditional-upload fallback. HTSlib's bundled S3
-writer does not provide this conditional publication guarantee, so the core
-API does not silently route S3 output through it. The adapter uses the
+The adapter streams the index through a pipe into an s3fs transactional
+multipart upload, with **no local input or index staging file**. It completes
+the upload only after indexing succeeds, using conditional creation to prevent
+overwriting an existing or concurrently created object. This requires an S3
+provider implementing conditional multipart completion; there is no
+unconditional-upload fallback. A failed operation attempts to abort the
+multipart upload; a provider-side lifecycle policy can clean up uploads if
+the process or network fails before the abort.
+
+The streaming adapter currently supports BGZF VCF, not BCF, and requires
+bundled HTSlib and POSIX ``/dev/fd``. It reads the source twice: once for
+contig metadata and once for the index, so the source must remain unchanged
+through both passes. Coordinate workers operate on bounded row batches. Index
+construction retains at most one chunk per genomic bin for one contig at a
+time, not the full index; at most 37,449 bins plus 32,768 seek offsets
+(about 841 KiB in total) are allocated.
+Contig names are limited to 100,000 and 16 MiB of name bytes. Memory also
+includes the header, longest record, worker batches and decompression buffers,
+Python objects and the S3 multipart buffer (at least 5 MiB); it is not bounded
+independently of worker count or record/header size.
+
+The streamed index can be less selective than HTSlib's standard index: CSI
+uses coarser bins when necessary to bound memory, and each bin's records are
+covered by a single range. Some region queries may read more data. The
+regular local ``build_index`` path still uses HTSlib's in-memory index and
+local atomic staging; use the adapter for bounded streaming to S3. HTSlib's
+bundled S3 writer does not provide this conditional publication guarantee, so
+the core API does not silently route S3 output through it. The adapter uses the
 filesystem backend's credentials separately from HTSlib's read credentials.
 For custom endpoints, configure both backends (e.g. HTSlib's host settings and
 the filesystem's ``AWS_ENDPOINT_URL_S3``). Core local-destination publication

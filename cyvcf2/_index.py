@@ -68,9 +68,8 @@ def _ranges(path, start):
             start = boundary
 
 
-def _build_parallel(path, destination, threads, workers):
-    from .cyvcf2 import _CoordinateIndexBuilder, _CoordinateReader
-    builder = _CoordinateIndexBuilder(path, destination)
+def _run_coordinate_batches(path, threads, workers, builder):
+    from .cyvcf2 import _CoordinateReader
     ranges = iter(_ranges(path, builder.offset0))
     pending = deque()
     readers = set()
@@ -102,6 +101,21 @@ def _build_parallel(path, destination, threads, workers):
     finally:
         for reader in readers:
             reader.close()
+
+
+def _build_parallel(path, destination, threads, workers):
+    from .cyvcf2 import _CoordinateIndexBuilder
+    _run_coordinate_batches(path, threads, workers, _CoordinateIndexBuilder(path, destination))
+
+
+def _stream_index(path, index_format, threads, workers, output_fd):
+    from .cyvcf2 import _StreamingCoordinateIndex
+    first = _StreamingCoordinateIndex(path, index_format)
+    _run_coordinate_batches(path, threads, workers, first)
+    second = _StreamingCoordinateIndex(path, index_format, output_fd, first.names)
+    _run_coordinate_batches(path, threads, workers, second)
+    if first.fingerprint != second.fingerprint or first.total != second.total:
+        raise OSError("index input changed between streaming passes")
 
 
 def _validate_input(path):

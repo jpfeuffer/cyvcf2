@@ -1178,6 +1178,185 @@ cdef class _CoordinateIndexBuilder:
             hts_idx_destroy(self.index)
 
 
+cdef class _StreamingCoordinateIndex:
+    cdef cyvcf2_stream_index state
+    cdef dict name_ids
+    cdef readonly list names
+    cdef readonly int64_t offset0
+    cdef readonly uint64_t fingerprint, total
+    cdef bint writing
+    cdef size_t name_bytes
+
+    def __cinit__(self, bytes path, str index_format, int output_fd=-1, names=None):
+        cdef const char *ptr = path
+        cdef htsFile *fp
+        cdef bcf_hdr_t *hdr = NULL
+        cdef bytes metadata, output_path
+        cdef const char *output_ptr
+        cdef const char *metadata_ptr
+        cdef int shift, levels, result
+        cdef Py_ssize_t metadata_length, name_count
+        cdef int fmt = HTS_FMT_TBI if index_format == "tbi" else HTS_FMT_CSI
+        self.state.tid = -1
+        self.state.format = fmt
+        self.names = [] if names is None else list(names)
+        self.name_ids = {name: i for i, name in enumerate(self.names)}
+        self.writing = output_fd >= 0
+        with nogil:
+            fp = hts_open(ptr, b"r")
+        if fp == NULL:
+            raise OSError("unable to open coordinate input")
+        try:
+            if fp.format.format != vcf or fp.format.compression != bgzf:
+                raise ValueError("bounded streaming indexing requires BGZF-compressed VCF")
+            with nogil:
+                hdr = bcf_hdr_read(fp)
+            if hdr == NULL:
+                raise OSError("cannot read VCF header for streaming indexing")
+            self.offset0 = bgzf_tell(fp.fp.bgzf)
+            _schema_index_settings(hdr, False, fmt, &shift, &levels)
+        finally:
+            if hdr != NULL:
+                bcf_hdr_destroy(hdr)
+            with nogil:
+                hts_close(fp)
+        while levels > 5:
+            shift += 3
+            levels -= 1
+        if shift + 3 * levels >= 63:
+            raise ValueError("VCF reference coordinates exceed supported index range")
+        self.state.shift = shift
+        self.state.levels = levels
+        self.state.nbins = ((1 << (3 * levels + 3)) - 1) // 7
+        self.state.last_offset = self.offset0
+        if self.writing:
+            if cyvcf2_stream_allocate(&self.state) < 0:
+                raise MemoryError("unable to allocate bounded streaming index bins")
+            metadata = _schema_vcf_index_metadata(self.names)
+            metadata_ptr = metadata
+            metadata_length = len(metadata)
+            name_count = len(self.names)
+            output_path = os.fsencode("/dev/fd/%d" % output_fd)
+            output_ptr = output_path
+            with nogil:
+                self.state.output = bgzf_open(output_ptr, b"w")
+            if self.state.output == NULL:
+                raise OSError("unable to open index output pipe")
+            with nogil:
+                if fmt == HTS_FMT_CSI:
+                    result = bgzf_write(self.state.output, b"CSI\1", 4) != 4
+                    result |= cyvcf2_stream_write(self.state.output, shift, 4)
+                    result |= cyvcf2_stream_write(self.state.output, levels, 4)
+                    result |= cyvcf2_stream_write(self.state.output, metadata_length, 4)
+                    result |= bgzf_write(self.state.output, metadata_ptr, metadata_length) != metadata_length
+                    result |= cyvcf2_stream_write(self.state.output, name_count, 4)
+                else:
+                    result = bgzf_write(self.state.output, b"TBI\1", 4) != 4
+                    result |= cyvcf2_stream_write(self.state.output, name_count, 4)
+                    result |= bgzf_write(self.state.output, metadata_ptr, metadata_length) != metadata_length
+            if result != 0:
+                raise OSError("unable to write streaming index header")
+
+    def add(self, _CoordinateBatch batch):
+        cdef int *mapping = <int *>stdlib.malloc(len(batch.names) * sizeof(int))
+        cdef int i, result = 0
+        cdef SchemaIndexEntry *entry
+        if mapping == NULL and batch.names:
+            raise MemoryError("unable to map coordinate contigs")
+        try:
+            for i, name in enumerate(batch.names):
+                if name not in self.name_ids:
+                    if self.writing:
+                        raise OSError("index input changed between streaming passes")
+                    self.name_bytes += len(name) + 1
+                    if self.name_bytes > 16 * 1024 * 1024 or len(self.names) >= 100000:
+                        raise ValueError("streaming index contig metadata exceeds memory limit")
+                    self.name_ids[name] = len(self.names)
+                    self.names.append(name)
+                mapping[i] = self.name_ids[name]
+            with nogil:
+                for i in range(batch.count):
+                    entry = batch.entries + i
+                    result = cyvcf2_stream_push(
+                        &self.state, mapping[entry.rid], entry.beg, entry.end, entry.offset)
+                    if result:
+                        break
+            if result == -2:
+                raise OSError("unable to write streaming index")
+            if result:
+                raise OSError("cannot build index: input must be coordinate-sorted and within range")
+        finally:
+            stdlib.free(mapping)
+
+    def finish(self, int64_t offset):
+        cdef int result = 0
+        if self.writing:
+            with nogil:
+                if self.state.tid >= 0:
+                    result = cyvcf2_stream_reference(&self.state)
+                if result == 0:
+                    result = cyvcf2_stream_write(self.state.output, 0, 8)
+                if bgzf_close(self.state.output) < 0:
+                    result = -1
+            self.state.output = NULL
+            if result:
+                raise OSError("unable to finish streaming index")
+        self.fingerprint = self.state.fingerprint
+        self.total = self.state.total
+
+    def __dealloc__(self):
+        if self.state.output != NULL:
+            with nogil:
+                bgzf_close(self.state.output)
+        stdlib.free(self.state.bins)
+        stdlib.free(self.state.linear)
+
+
+cdef int _index_threads(threads, workers) except -1:
+    if isinstance(threads, bool) or not isinstance(threads, int) or threads < 0:
+        raise ValueError("threads must be a non-negative integer")
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise ValueError("workers must be a positive integer")
+    return threads
+
+
+cdef void _check_index_result(int result, bytes fname, bytes destination) except *:
+    if result == -2:
+        raise OSError("unable to open index input: %s" % os.fsdecode(fname))
+    if result == -3:
+        raise ValueError("index creation requires BGZF-compressed VCF/BCF")
+    if result == -4:
+        raise OSError("unable to save index to %s" % os.fsdecode(destination))
+    if result != 0:
+        raise OSError(
+            "HTSlib indexing failed for %s: input must be coordinate-sorted; "
+            "BCF requires a .csi index (status %d)" % (os.fsdecode(fname), result))
+
+
+def _build_index_to_fd(path, fd, index_format="csi", threads=0, workers=1):
+    """Write a finalized native index to a POSIX pipe without staging files."""
+    import stat
+    from ._index import _validate_input, _stream_index
+    cdef bytes fname = os.fsencode(path)
+    cdef int n_threads = _index_threads(threads, workers)
+    if not fname or b"\0" in fname:
+        raise ValueError("input path must be non-empty and contain no NUL bytes")
+    remote_input = _validate_input(fname)
+    if not remote_input and not os.path.isfile(fname):
+        raise OSError("index input must be an existing local file: %s" % os.fsdecode(fname))
+    if index_format not in ("csi", "tbi"):
+        raise ValueError("index_format must be csi or tbi")
+    if isinstance(fd, bool) or not isinstance(fd, int) or fd < 0:
+        raise ValueError("output must be an open pipe descriptor")
+    if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+        raise ValueError("output must be an open pipe descriptor")
+    if not os.path.isdir("/dev/fd"):
+        raise NotImplementedError("native index pipe output requires POSIX /dev/fd")
+    if not CYVCF2_COORDINATE_WORKERS:
+        raise NotImplementedError("bounded streaming indexing requires bundled HTSlib")
+    _stream_index(fname, index_format, n_threads, workers, fd)
+
+
 def build_index(path, index_path=None, threads=0, workers=1):
     """Build an index without scanning schema or decoding sample genotypes.
 
@@ -1203,11 +1382,7 @@ def build_index(path, index_path=None, threads=0, workers=1):
     cdef int min_shift
     cdef int result
 
-    if isinstance(threads, bool) or not isinstance(threads, int) or threads < 0:
-        raise ValueError("threads must be a non-negative integer")
-    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
-        raise ValueError("workers must be a positive integer")
-    n_threads = threads
+    n_threads = _index_threads(threads, workers)
     destination = fname + b".csi" if index_path is None else os.fsencode(index_path)
     if not fname or b"\0" in fname or not destination or b"\0" in destination:
         raise ValueError("input and index paths must be non-empty and contain no NUL bytes")
@@ -1242,16 +1417,7 @@ def build_index(path, index_path=None, threads=0, workers=1):
         staging_ptr = staging
         with nogil:
             result = bcf_index_build3(input_ptr, staging_ptr, min_shift, n_threads)
-        if result == -2:
-            raise OSError("unable to open index input: %s" % os.fsdecode(fname))
-        if result == -3:
-            raise ValueError("index creation requires BGZF-compressed VCF/BCF")
-        if result == -4:
-            raise OSError("unable to save index to %s" % os.fsdecode(destination))
-        if result != 0:
-            raise OSError(
-                "HTSlib indexing failed for %s: input must be coordinate-sorted; "
-                "BCF requires a .csi index (status %d)" % (os.fsdecode(fname), result))
+        _check_index_result(result, fname, destination)
         os.link(staging, destination)
     return os.fsdecode(destination)
 

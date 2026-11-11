@@ -52,6 +52,24 @@ cdef extern from "htslib/bgzf.h":
     int64_t bgzf_seek(BGZF *fp, int64_t pos, int whence) nogil
     int bgzf_getline(BGZF *fp, int delim, kstring_t *str) nogil
     ssize_t bgzf_read(BGZF *fp, void *data, size_t length) nogil
+    ssize_t bgzf_write(BGZF *fp, const void *data, size_t length) nogil
+
+cdef extern from "stream_index.h":
+    ctypedef struct cyvcf2_stream_bin:
+        pass
+    ctypedef struct cyvcf2_stream_index:
+        cyvcf2_stream_bin *bins
+        uint64_t *linear
+        BGZF *output
+        uint32_t nbins, used, n_linear
+        int shift, levels, format, tid
+        int64_t last_pos
+        uint64_t last_offset, ref_start, count
+        uint64_t fingerprint, total
+    int cyvcf2_stream_allocate(cyvcf2_stream_index *)
+    int cyvcf2_stream_push(cyvcf2_stream_index *, int, int64_t, int64_t, uint64_t) nogil
+    int cyvcf2_stream_reference(cyvcf2_stream_index *) nogil
+    int cyvcf2_stream_write(BGZF *, uint64_t, int) nogil
 
 cdef extern from "htslib/hts.h":
 
