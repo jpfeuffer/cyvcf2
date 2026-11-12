@@ -6,9 +6,9 @@ squashing their histories. ``ci/internal-release.toml`` records their exact
 tips and common upstream base. Packaging-only changes belong on this branch,
 not the topic branches.
 
-Versions use a PEP 440 local suffix, currently ``0.35.0+pfizer.2``. Never
+Versions use a PEP 440 local suffix, currently ``0.35.0+pfizer.3``. Never
 overwrite an uploaded version. Tag validated commits with
-``pfizer/cyvcf2/0.35.0+pfizer.2``; never use ``v*`` tags, which trigger the
+``pfizer/cyvcf2/0.35.0+pfizer.3``; never use ``v*`` tags, which trigger the
 upstream public PyPI release workflow. The private index is explicit, so
 ordinary dependency resolution does not silently use it.
 
@@ -106,7 +106,7 @@ files from the private index, compare their SHA-256 values with
 ``SHA256SUMS``, and verify a fresh exact-version install from that index::
 
     uv pip install --python /absolute/path/to/fresh/venv/bin/python \
-        --index csartifacts "cyvcf2==0.35.0+pfizer.2"
+        --index csartifacts "cyvcf2==0.35.0+pfizer.3"
 
 Report publication as incomplete until both platform wheels, server metadata,
 downloaded hashes, and clean installs have been verified.
