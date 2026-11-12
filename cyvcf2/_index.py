@@ -136,8 +136,22 @@ def _run_coordinate_batches(path, threads, workers, builder, progress=None, pass
                 readers.add(reader)
                 pending.append((reader, pool.submit(reader.read)))
 
-            for _ in range(workers):
-                submit_range()
+            if b"://" in path:
+                limits = list(ranges)
+                opening = [pool.submit(_CoordinateReader, path, *limit, threads) for limit in limits]
+                try:
+                    for future in opening:
+                        reader = future.result()
+                        readers.add(reader)
+                        pending.append((reader, pool.submit(reader.read)))
+                finally:
+                    for future in opening:
+                        if not future.cancel():
+                            if future.exception() is None:
+                                readers.add(future.result())
+            else:
+                for _ in range(workers):
+                    submit_range()
             while pending:
                 reader, future = pending.popleft()
                 batch = future.result()
