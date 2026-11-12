@@ -102,6 +102,10 @@ explicit; there is no automatic CPU-budget selection in ``build_index``.
 
 Scheduling uses roughly 4 MiB compressed ranges and at most one outstanding
 native batch per worker, each capped at 65,536 coordinate entries (2 MiB).
+Remote input instead uses at most one contiguous range per worker, located
+with ``O(workers)`` BGZF boundary probes. Readers stay open across bounded
+batches, avoiding repeated remote opens for every 4 MiB. This also applies
+to each pass of bounded remote indexing; batch memory limits are unchanged.
 Split discovery reads small windows near compressed targets, not a whole-file
 BGZF-offset list. There is no per-record temporary stream. Memory includes the
 final HTSlib index, bounded coordinate batches, per-worker decompression buffers,

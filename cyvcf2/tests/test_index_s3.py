@@ -375,6 +375,30 @@ def test_parallel_remote_schema_invalid_index_preserved(s3_server, schema_remote
     assert destination.read_bytes() == b"existing"
 
 
+@pytest.mark.parametrize("bounded", [False, True])
+def test_remote_index_reuses_readers(s3_server, coordinate_vcf, tmp_path, monkeypatch, bounded):
+    objects, _ = s3_server
+    objects["/cyvcf2-test/reused.vcf.gz"] = coordinate_vcf.read_bytes()
+    original = native._CoordinateReader
+    opened = []
+
+    def reader(*args):
+        opened.append(args[1:3])
+        return original(*args)
+
+    monkeypatch.setattr(native, "_CoordinateReader", reader)
+    destination = tmp_path / "reused.csi"
+    build_index(
+        "s3+http://cyvcf2-test/reused.vcf.gz", destination,
+        workers=4, threads=1, bounded=bounded,
+    )
+    assert 0 < len(opened) <= 4 * (2 if bounded else 1)
+    with VCF(str(coordinate_vcf), samples=[]) as source:
+        source.set_index(str(destination))
+        assert source.num_records == 800
+        assert list(source("1:150-150"))
+
+
 def test_native_s3_requires_local_destination():
     with pytest.raises(ValueError, match="explicit local index_path"):
         build_index("s3://bucket/input.vcf.gz")

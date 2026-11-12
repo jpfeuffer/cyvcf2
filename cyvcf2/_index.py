@@ -90,9 +90,14 @@ def _next_block(stream, target, size):
             raise OSError("no BGZF boundary before EOF")
 
 
-def _ranges(path, start):
+def _ranges(path, start, workers=None):
     from .cyvcf2 import _coordinate_boundary, _IndexRemoteFile
     remote = b"://" in path
+    if remote and workers is not None:
+        from ._schema_scan import _remote_split_ranges
+        for begin, end, _ in _remote_split_ranges(path, workers, start, False):
+            yield max(start, begin), end
+        return
     with (_IndexRemoteFile(path) if remote else open(path, "rb")) as stream:
         size = stream.size if remote else os.path.getsize(path)
         while True:
@@ -113,7 +118,9 @@ def _ranges(path, start):
 
 def _run_coordinate_batches(path, threads, workers, builder, progress=None, pass_number=1):
     from .cyvcf2 import _CoordinateReader
-    ranges = iter(_ranges(path, builder.offset0))
+    ranges = iter(
+        _ranges(path, builder.offset0, workers) if b"://" in path
+        else _ranges(path, builder.offset0))
     pending = deque()
     readers = set()
     offset = builder.offset0
